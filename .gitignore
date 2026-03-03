@@ -1,1 +1,5 @@
-__pycache__/free_fall_surprise_transformer.cpython-313.pyc
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*$py.class

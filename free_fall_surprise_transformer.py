@@ -17,13 +17,16 @@ import argparse
 import io
 import json
 import math
-import os
 import random
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
-import imageio.v2 as imageio
+try:
+    import imageio.v2 as imageio
+except Exception:  # pragma: no cover - optional dependency for GIF output only
+    imageio = None
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -33,6 +36,11 @@ from torch.utils.data import DataLoader, Dataset
 
 
 LOG_2PI = math.log(2.0 * math.pi)
+
+
+def log_progress(label: str, current: int, total: int) -> None:
+    pct = 100.0 * float(current) / float(max(total, 1))
+    print(f"[PROGRESS] {label}: {current}/{total} ({pct:.1f}%)", flush=True)
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,11 +58,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dt", type=float, default=0.05, help="Timestep size.")
     parser.add_argument("--epochs", type=int, default=40, help="Training epochs.")
     parser.add_argument("--batch_size", type=int, default=128, help="Batch size.")
+    parser.add_argument(
+        "--min_batch_size",
+        type=int,
+        default=8,
+        help="Minimum batch size allowed when auto-retrying after CUDA OOM.",
+    )
+    parser.add_argument(
+        "--oom_retries",
+        type=int,
+        default=4,
+        help="Maximum number of CUDA OOM retries with reduced batch size.",
+    )
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
     parser.add_argument("--d_model", type=int, default=128, help="Transformer d_model.")
     parser.add_argument("--nhead", type=int, default=8, help="Attention heads.")
     parser.add_argument("--num_layers", type=int, default=4, help="Encoder layers.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout.")
+    parser.add_argument(
+        "--amp",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Enable AMP mixed precision on CUDA.",
+    )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
         "--device",
@@ -76,6 +103,31 @@ def parse_args() -> argparse.Namespace:
         choices=[0, 1],
         help="Whether to save model checkpoint.",
     )
+    parser.add_argument(
+        "--save_gifs",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Whether to generate per-trajectory GIF overlays.",
+    )
+    parser.add_argument(
+        "--gif_stride",
+        type=int,
+        default=1,
+        help="Frame stride for GIF rendering (higher is faster/smaller).",
+    )
+    parser.add_argument(
+        "--quality_eval_samples",
+        type=int,
+        default=256,
+        help="Validation samples for prediction-quality sanity check.",
+    )
+    parser.add_argument(
+        "--max_visualizations_per_group",
+        type=int,
+        default=200,
+        help="Safety cap on PNG/GIF renders per evaluation group.",
+    )
     args = parser.parse_args()
     if args.x <= 0:
         raise ValueError("--x must be > 0")
@@ -83,6 +135,24 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--train_n and --val_n must be > 0")
     if args.seq_len < 4:
         raise ValueError("--seq_len must be >= 4")
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be > 0")
+    if args.min_batch_size <= 0:
+        raise ValueError("--min_batch_size must be > 0")
+    if args.min_batch_size > args.batch_size:
+        raise ValueError("--min_batch_size cannot be larger than --batch_size")
+    if args.oom_retries < 0:
+        raise ValueError("--oom_retries must be >= 0")
+    if args.d_model % args.nhead != 0:
+        raise ValueError("--d_model must be divisible by --nhead")
+    if args.gif_stride <= 0:
+        raise ValueError("--gif_stride must be > 0")
+    if args.quality_eval_samples <= 0:
+        raise ValueError("--quality_eval_samples must be > 0")
+    if args.max_visualizations_per_group < 0:
+        raise ValueError("--max_visualizations_per_group must be >= 0")
+    if args.save_gifs == 1 and imageio is None:
+        raise RuntimeError("GIF saving requested but imageio is not installed.")
     return args
 
 
@@ -203,15 +273,23 @@ def simulate_physical_trajectory(
 
 
 def generate_physical_dataset(
-    n: int, seq_len: int, dt: float, mode: str, rng: np.random.Generator
+    n: int,
+    seq_len: int,
+    dt: float,
+    mode: str,
+    rng: np.random.Generator,
+    progress_label: Optional[str] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, float]]]:
     trajectories = np.zeros((n, seq_len, 2), dtype=np.float32)
     metadata: List[Dict[str, float]] = []
+    progress_stride = max(1, n // 10)
     for i in range(n):
         params = sample_physical_params(rng, mode=mode)
         traj = simulate_physical_trajectory(seq_len=seq_len, dt=dt, params=params, rng=rng)
         trajectories[i] = traj
         metadata.append(params)
+        if progress_label and ((i + 1) == 1 or (i + 1) % progress_stride == 0 or (i + 1) == n):
+            log_progress(progress_label, i + 1, n)
     return trajectories, metadata
 
 
@@ -262,11 +340,16 @@ def generate_teleport_jump(seq_len: int, dt: float, rng: np.random.Generator) ->
 
 
 def generate_nonphysical_dataset(
-    n: int, seq_len: int, dt: float, rng: np.random.Generator
+    n: int,
+    seq_len: int,
+    dt: float,
+    rng: np.random.Generator,
+    progress_label: Optional[str] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, float]]]:
     trajectories = np.zeros((n, seq_len, 2), dtype=np.float32)
     metadata: List[Dict[str, float]] = []
     regimes = ["random_walk", "anti_gravity", "sinusoidal_forcing", "teleport_jump"]
+    progress_stride = max(1, n // 10)
 
     for i in range(n):
         regime = str(rng.choice(regimes))
@@ -286,6 +369,8 @@ def generate_nonphysical_dataset(
                 "is_physical": 0,
             }
         )
+        if progress_label and ((i + 1) == 1 or (i + 1) % progress_stride == 0 or (i + 1) == n):
+            log_progress(progress_label, i + 1, n)
     return trajectories, metadata
 
 
@@ -372,9 +457,18 @@ def train_model(
     device: torch.device,
     epochs: int,
     lr: float,
+    amp: bool,
 ) -> Dict[str, List[float]]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     history = {"train_loss": [], "val_loss": []}
+    use_amp = bool(amp and device.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    print(
+        "[INFO] Training setup | epochs={} train_batches={} val_batches={} lr={} amp={}".format(
+            epochs, len(train_loader), len(val_loader), lr, int(use_amp)
+        ),
+        flush=True,
+    )
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -384,11 +478,20 @@ def train_model(
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
             optimizer.zero_grad(set_to_none=True)
-            mu, log_sigma = model(x_batch)
-            loss = gaussian_nll_loss(mu, log_sigma, y_batch)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                mu, log_sigma = model(x_batch)
+                loss = gaussian_nll_loss(mu, log_sigma, y_batch)
+
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
 
             bs = x_batch.shape[0]
             train_loss_sum += float(loss.item()) * bs
@@ -401,8 +504,9 @@ def train_model(
             for x_batch, y_batch in val_loader:
                 x_batch = x_batch.to(device)
                 y_batch = y_batch.to(device)
-                mu, log_sigma = model(x_batch)
-                loss = gaussian_nll_loss(mu, log_sigma, y_batch)
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                    mu, log_sigma = model(x_batch)
+                    loss = gaussian_nll_loss(mu, log_sigma, y_batch)
                 bs = x_batch.shape[0]
                 val_loss_sum += float(loss.item()) * bs
                 val_count += bs
@@ -413,8 +517,9 @@ def train_model(
         history["val_loss"].append(val_loss)
 
         if epoch == 1 or epoch % max(1, epochs // 10) == 0 or epoch == epochs:
+            pct = 100.0 * float(epoch) / float(max(epochs, 1))
             print(
-                f"[Epoch {epoch:03d}/{epochs}] train_nll={train_loss:.5f} val_nll={val_loss:.5f}",
+                f"[Epoch {epoch:03d}/{epochs}] ({pct:.1f}%) train_nll={train_loss:.5f} val_nll={val_loss:.5f}",
                 flush=True,
             )
 
@@ -439,9 +544,18 @@ def score_single_trajectory(
     pred = pred_norm * stats.std + stats.mean
     actual = trajectory[1:, :].astype(np.float64)
     time = np.arange(actual.shape[0], dtype=np.float64)
+    err = pred - actual
+    rmse_pos = float(np.sqrt(np.mean(err[:, 0] ** 2)))
+    rmse_vel = float(np.sqrt(np.mean(err[:, 1] ** 2)))
+    mae_pos = float(np.mean(np.abs(err[:, 0])))
+    mae_vel = float(np.mean(np.abs(err[:, 1])))
     return {
         "surprise_mean_nll": float(np.mean(nll_steps)),
         "surprise_std_nll": float(np.std(nll_steps)),
+        "rmse_pos": rmse_pos,
+        "rmse_vel": rmse_vel,
+        "mae_pos": mae_pos,
+        "mae_vel": mae_vel,
         "nll_steps": nll_steps,
         "pred": pred,
         "actual": actual,
@@ -469,10 +583,19 @@ def save_overlay_png(path: Path, time: np.ndarray, actual: np.ndarray, pred: np.
     plt.close(fig)
 
 
-def save_overlay_gif(path: Path, time: np.ndarray, actual: np.ndarray, pred: np.ndarray, title: str) -> None:
+def save_overlay_gif(
+    path: Path,
+    time: np.ndarray,
+    actual: np.ndarray,
+    pred: np.ndarray,
+    title: str,
+    frame_stride: int = 1,
+) -> None:
+    if imageio is None:
+        raise RuntimeError("Cannot save GIF: imageio is not available.")
     frames: List[np.ndarray] = []
     total_steps = len(time)
-    for t_end in range(2, total_steps + 1):
+    for t_end in range(2, total_steps + 1, frame_stride):
         fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
         axes[0].plot(time[:t_end], actual[:t_end, 0], label="actual_pos", linewidth=2.0)
         axes[0].plot(time[:t_end], pred[:t_end, 0], label="pred_pos", linewidth=1.8, alpha=0.85)
@@ -487,6 +610,30 @@ def save_overlay_gif(path: Path, time: np.ndarray, actual: np.ndarray, pred: np.
         axes[1].grid(alpha=0.3)
         axes[1].legend(loc="best")
 
+        fig.suptitle(f"{title} (t={t_end}/{total_steps})")
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=110)
+        plt.close(fig)
+        buf.seek(0)
+        frames.append(imageio.imread(buf))
+        buf.close()
+
+    if (total_steps - 1) % frame_stride != 0:
+        # Ensure final state is included even with stride > 1.
+        t_end = total_steps
+        fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+        axes[0].plot(time[:t_end], actual[:t_end, 0], label="actual_pos", linewidth=2.0)
+        axes[0].plot(time[:t_end], pred[:t_end, 0], label="pred_pos", linewidth=1.8, alpha=0.85)
+        axes[0].set_ylabel("Position")
+        axes[0].grid(alpha=0.3)
+        axes[0].legend(loc="best")
+        axes[1].plot(time[:t_end], actual[:t_end, 1], label="actual_vel", linewidth=2.0)
+        axes[1].plot(time[:t_end], pred[:t_end, 1], label="pred_vel", linewidth=1.8, alpha=0.85)
+        axes[1].set_xlabel("Time step")
+        axes[1].set_ylabel("Velocity")
+        axes[1].grid(alpha=0.3)
+        axes[1].legend(loc="best")
         fig.suptitle(f"{title} (t={t_end}/{total_steps})")
         fig.tight_layout()
         buf = io.BytesIO()
@@ -543,6 +690,65 @@ def summarize_scores(scores: np.ndarray) -> Dict[str, float]:
     }
 
 
+def summarize_prediction_errors(records: List[Dict[str, object]], group: str) -> Dict[str, float]:
+    group_rows = [r for r in records if str(r.get("group")) == group]
+    if not group_rows:
+        return {}
+    rmse_pos = np.asarray([float(r["rmse_pos"]) for r in group_rows], dtype=np.float64)
+    rmse_vel = np.asarray([float(r["rmse_vel"]) for r in group_rows], dtype=np.float64)
+    mae_pos = np.asarray([float(r["mae_pos"]) for r in group_rows], dtype=np.float64)
+    mae_vel = np.asarray([float(r["mae_vel"]) for r in group_rows], dtype=np.float64)
+    return {
+        "rmse_pos_mean": float(np.mean(rmse_pos)),
+        "rmse_vel_mean": float(np.mean(rmse_vel)),
+        "mae_pos_mean": float(np.mean(mae_pos)),
+        "mae_vel_mean": float(np.mean(mae_vel)),
+        "rmse_pos_median": float(np.median(rmse_pos)),
+        "rmse_vel_median": float(np.median(rmse_vel)),
+        "mae_pos_median": float(np.median(mae_pos)),
+        "mae_vel_median": float(np.median(mae_vel)),
+    }
+
+
+def evaluate_prediction_quality_subset(
+    model: nn.Module,
+    trajectories: np.ndarray,
+    stats: NormStats,
+    device: torch.device,
+    max_samples: int,
+    label: str,
+) -> Dict[str, float]:
+    n_total = int(trajectories.shape[0])
+    n_eval = min(n_total, int(max_samples))
+    stride = max(1, n_eval // 10)
+
+    rmse_pos_vals: List[float] = []
+    rmse_vel_vals: List[float] = []
+    mae_pos_vals: List[float] = []
+    mae_vel_vals: List[float] = []
+
+    for i in range(n_eval):
+        res = score_single_trajectory(model, trajectories[i], stats, device)
+        rmse_pos_vals.append(float(res["rmse_pos"]))
+        rmse_vel_vals.append(float(res["rmse_vel"]))
+        mae_pos_vals.append(float(res["mae_pos"]))
+        mae_vel_vals.append(float(res["mae_vel"]))
+        if (i + 1) == 1 or (i + 1) % stride == 0 or (i + 1) == n_eval:
+            log_progress(label, i + 1, n_eval)
+
+    rmse_pos_arr = np.asarray(rmse_pos_vals, dtype=np.float64)
+    rmse_vel_arr = np.asarray(rmse_vel_vals, dtype=np.float64)
+    mae_pos_arr = np.asarray(mae_pos_vals, dtype=np.float64)
+    mae_vel_arr = np.asarray(mae_vel_vals, dtype=np.float64)
+    return {
+        "sample_count": int(n_eval),
+        "rmse_pos_mean": float(np.mean(rmse_pos_arr)),
+        "rmse_vel_mean": float(np.mean(rmse_vel_arr)),
+        "mae_pos_mean": float(np.mean(mae_pos_arr)),
+        "mae_vel_mean": float(np.mean(mae_vel_arr)),
+    }
+
+
 def cohen_d(a: np.ndarray, b: np.ndarray) -> float:
     # Effect size for difference in means: b - a
     var_a = float(np.var(a, ddof=1)) if a.shape[0] > 1 else 0.0
@@ -553,6 +759,7 @@ def cohen_d(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def main() -> None:
+    run_start = time.time()
     args = parse_args()
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -560,41 +767,165 @@ def main() -> None:
     paths = ensure_dirs(output_dir)
     rng = np.random.default_rng(args.seed)
 
-    print(f"[INFO] Device: {device}")
-    print("[INFO] Generating datasets...")
-    train_traj, _ = generate_physical_dataset(args.train_n, args.seq_len, args.dt, mode="train", rng=rng)
-    val_traj, _ = generate_physical_dataset(args.val_n, args.seq_len, args.dt, mode="train", rng=rng)
-    phys_ood_traj, phys_ood_meta = generate_physical_dataset(args.x, args.seq_len, args.dt, mode="ood", rng=rng)
-    nonphys_traj, nonphys_meta = generate_nonphysical_dataset(args.x, args.seq_len, args.dt, rng=rng)
+    print("[STAGE 1/9] Setup", flush=True)
+    print(f"[INFO] Device: {device}", flush=True)
+    print(f"[INFO] Output directory: {output_dir}", flush=True)
+    print(
+        "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} d_model={} nhead={} num_layers={} amp={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
+            args.x,
+            args.train_n,
+            args.val_n,
+            args.seq_len,
+            args.dt,
+            args.epochs,
+            args.batch_size,
+            args.lr,
+            args.d_model,
+            args.nhead,
+            args.num_layers,
+            args.amp,
+            args.save_gifs,
+            args.max_visualizations_per_group,
+            args.oom_retries,
+            args.min_batch_size,
+        ),
+        flush=True,
+    )
 
+    print("[STAGE 2/9] Generating datasets", flush=True)
+    print("[INFO] Generating in-distribution physical training trajectories...", flush=True)
+    train_traj, _ = generate_physical_dataset(
+        args.train_n,
+        args.seq_len,
+        args.dt,
+        mode="train",
+        rng=rng,
+        progress_label="generate_train_physical",
+    )
+    print("[INFO] Generating in-distribution physical validation trajectories...", flush=True)
+    val_traj, _ = generate_physical_dataset(
+        args.val_n,
+        args.seq_len,
+        args.dt,
+        mode="train",
+        rng=rng,
+        progress_label="generate_val_physical",
+    )
+    print("[INFO] Generating physical out-of-distribution evaluation trajectories...", flush=True)
+    phys_ood_traj, phys_ood_meta = generate_physical_dataset(
+        args.x,
+        args.seq_len,
+        args.dt,
+        mode="ood",
+        rng=rng,
+        progress_label="generate_eval_physical_ood",
+    )
+    print("[INFO] Generating non-physical evaluation trajectories...", flush=True)
+    nonphys_traj, nonphys_meta = generate_nonphysical_dataset(
+        args.x,
+        args.seq_len,
+        args.dt,
+        rng=rng,
+        progress_label="generate_eval_non_physical",
+    )
+
+    print("[STAGE 3/9] Normalization and data loaders", flush=True)
     stats = compute_norm_stats(train_traj)
     train_norm = normalize_trajectories(train_traj, stats)
     val_norm = normalize_trajectories(val_traj, stats)
 
     train_ds = TrajectoryDataset(train_norm)
     val_ds = TrajectoryDataset(val_norm)
-    loader_gen = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=False, generator=loader_gen)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False)
-
-    model = CausalTrajectoryTransformer(
-        d_model=args.d_model,
-        nhead=args.nhead,
-        num_layers=args.num_layers,
-        dropout=args.dropout,
-        max_seq_len=args.seq_len - 1,
-    ).to(device)
-
-    print("[INFO] Training transformer on physical-only trajectories...")
-    history = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        device=device,
-        epochs=args.epochs,
-        lr=args.lr,
+    print(
+        f"[INFO] Dataset sizes | train={len(train_ds)} val={len(val_ds)} eval_total={2 * args.x}",
+        flush=True,
     )
 
+    print("[STAGE 4/9] Model initialization", flush=True)
+
+    def build_model() -> CausalTrajectoryTransformer:
+        return CausalTrajectoryTransformer(
+            d_model=args.d_model,
+            nhead=args.nhead,
+            num_layers=args.num_layers,
+            dropout=args.dropout,
+            max_seq_len=args.seq_len - 1,
+        ).to(device)
+
+    def build_loaders(batch_size: int) -> Tuple[DataLoader, DataLoader]:
+        loader_gen = torch.Generator().manual_seed(args.seed)
+        train_loader_local = DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            generator=loader_gen,
+            num_workers=0,
+        )
+        val_loader_local = DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            num_workers=0,
+        )
+        return train_loader_local, val_loader_local
+
+    print("[STAGE 5/9] Training transformer on physical-only trajectories", flush=True)
+    current_batch_size = int(args.batch_size)
+    model: Optional[CausalTrajectoryTransformer] = None
+    history: Dict[str, List[float]] = {"train_loss": [], "val_loss": []}
+    oom_retries_used = 0
+
+    while True:
+        model = build_model()
+        train_loader, val_loader = build_loaders(current_batch_size)
+        print(
+            f"[INFO] Training attempt {oom_retries_used + 1} | batch_size={current_batch_size}",
+            flush=True,
+        )
+        try:
+            history = train_model(
+                model=model,
+                train_loader=train_loader,
+                val_loader=val_loader,
+                device=device,
+                epochs=args.epochs,
+                lr=args.lr,
+                amp=bool(args.amp),
+            )
+            break
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            is_oom = "out of memory" in msg or "cuda error: out of memory" in msg
+            can_retry = (
+                device.type == "cuda"
+                and is_oom
+                and oom_retries_used < args.oom_retries
+                and current_batch_size > args.min_batch_size
+            )
+            if not can_retry:
+                raise
+            next_batch_size = max(args.min_batch_size, current_batch_size // 2)
+            if next_batch_size == current_batch_size:
+                raise
+            oom_retries_used += 1
+            print(
+                f"[WARN] CUDA OOM detected. Retrying with smaller batch size: {current_batch_size} -> {next_batch_size}",
+                flush=True,
+            )
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            current_batch_size = next_batch_size
+
+    print(
+        f"[INFO] Training completed with effective_batch_size={current_batch_size} oom_retries_used={oom_retries_used}",
+        flush=True,
+    )
+
+    print("[STAGE 6/9] Saving checkpoint (if enabled)", flush=True)
+    if model is None:
+        raise RuntimeError("Model was not initialized successfully.")
     if args.save_checkpoint == 1:
         ckpt_path = paths["checkpoints"] / "model.pt"
         torch.save(
@@ -603,16 +934,50 @@ def main() -> None:
                 "norm_mean": stats.mean.tolist(),
                 "norm_std": stats.std.tolist(),
                 "args": vars(args),
+                "effective_batch_size": current_batch_size,
+                "oom_retries_used": oom_retries_used,
                 "train_history": history,
             },
             ckpt_path,
         )
-        print(f"[INFO] Saved checkpoint: {ckpt_path}")
+        print(f"[INFO] Saved checkpoint: {ckpt_path}", flush=True)
+    else:
+        print("[INFO] Checkpoint saving disabled.", flush=True)
 
-    print("[INFO] Scoring physical OOD and non-physical trajectories...")
+    print("[STAGE 7/9] Sanity check: prediction quality on in-distribution validation subset", flush=True)
+    val_quality = evaluate_prediction_quality_subset(
+        model=model,
+        trajectories=val_traj,
+        stats=stats,
+        device=device,
+        max_samples=args.quality_eval_samples,
+        label="id_val_prediction_quality",
+    )
+    print(
+        "[INFO] ID validation quality | samples={} rmse_pos={:.4f} rmse_vel={:.4f} mae_pos={:.4f} mae_vel={:.4f}".format(
+            val_quality["sample_count"],
+            val_quality["rmse_pos_mean"],
+            val_quality["rmse_vel_mean"],
+            val_quality["mae_pos_mean"],
+            val_quality["mae_vel_mean"],
+        ),
+        flush=True,
+    )
+
+    print("[STAGE 8/9] Scoring + rendering trajectories", flush=True)
+    if args.save_gifs == 0:
+        print("[INFO] GIF rendering disabled (--save_gifs=0). PNG overlays will still be generated.", flush=True)
     records: List[Dict[str, object]] = []
     physical_scores: List[float] = []
     nonphysical_scores: List[float] = []
+    max_viz = int(args.max_visualizations_per_group)
+    physical_rendered = 0
+    nonphysical_rendered = 0
+    physical_viz_skip_notified = False
+    nonphysical_viz_skip_notified = False
+    eval_total = 2 * args.x
+    eval_done = 0
+    eval_progress_stride = max(1, eval_total // 10)
 
     # Physical OOD group
     for i in range(args.x):
@@ -623,8 +988,25 @@ def main() -> None:
         png_path = paths["plots_physical"] / f"traj_{i:04d}.png"
         gif_path = paths["gifs_physical"] / f"traj_{i:04d}.gif"
         title = f"Physical OOD | {traj_id} | mean_nll={score:.4f}"
-        save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
-        save_overlay_gif(gif_path, res["time"], res["actual"], res["pred"], title)
+        should_render = i < max_viz
+        if should_render:
+            save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
+            physical_rendered += 1
+            if args.save_gifs == 1:
+                save_overlay_gif(
+                    gif_path,
+                    res["time"],
+                    res["actual"],
+                    res["pred"],
+                    title,
+                    frame_stride=args.gif_stride,
+                )
+        elif not physical_viz_skip_notified:
+            print(
+                f"[WARN] Visualization cap reached for physical_ood group (max={max_viz}). Remaining trajectories will be scored but not rendered.",
+                flush=True,
+            )
+            physical_viz_skip_notified = True
 
         meta = dict(phys_ood_meta[i])
         meta["group"] = "physical_ood"
@@ -635,9 +1017,17 @@ def main() -> None:
                 "group": "physical_ood",
                 "surprise_mean_nll": score,
                 "surprise_std_nll": float(res["surprise_std_nll"]),
+                "rmse_pos": float(res["rmse_pos"]),
+                "rmse_vel": float(res["rmse_vel"]),
+                "mae_pos": float(res["mae_pos"]),
+                "mae_vel": float(res["mae_vel"]),
                 "metadata_json": json.dumps(meta, sort_keys=True),
             }
         )
+        eval_done += 1
+        if eval_done == 1 or eval_done % eval_progress_stride == 0 or eval_done == eval_total:
+            log_progress("score_and_render", eval_done, eval_total)
+            print(f"[INFO] Latest complete: {traj_id} | score={score:.5f}", flush=True)
 
     # Non-physical group
     for i in range(args.x):
@@ -648,8 +1038,25 @@ def main() -> None:
         png_path = paths["plots_nonphysical"] / f"traj_{i:04d}.png"
         gif_path = paths["gifs_nonphysical"] / f"traj_{i:04d}.gif"
         title = f"Non-Physical | {traj_id} | mean_nll={score:.4f}"
-        save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
-        save_overlay_gif(gif_path, res["time"], res["actual"], res["pred"], title)
+        should_render = i < max_viz
+        if should_render:
+            save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
+            nonphysical_rendered += 1
+            if args.save_gifs == 1:
+                save_overlay_gif(
+                    gif_path,
+                    res["time"],
+                    res["actual"],
+                    res["pred"],
+                    title,
+                    frame_stride=args.gif_stride,
+                )
+        elif not nonphysical_viz_skip_notified:
+            print(
+                f"[WARN] Visualization cap reached for non_physical group (max={max_viz}). Remaining trajectories will be scored but not rendered.",
+                flush=True,
+            )
+            nonphysical_viz_skip_notified = True
 
         meta = dict(nonphys_meta[i])
         meta["group"] = "non_physical"
@@ -659,10 +1066,19 @@ def main() -> None:
                 "group": "non_physical",
                 "surprise_mean_nll": score,
                 "surprise_std_nll": float(res["surprise_std_nll"]),
+                "rmse_pos": float(res["rmse_pos"]),
+                "rmse_vel": float(res["rmse_vel"]),
+                "mae_pos": float(res["mae_pos"]),
+                "mae_vel": float(res["mae_vel"]),
                 "metadata_json": json.dumps(meta, sort_keys=True),
             }
         )
+        eval_done += 1
+        if eval_done == 1 or eval_done % eval_progress_stride == 0 or eval_done == eval_total:
+            log_progress("score_and_render", eval_done, eval_total)
+            print(f"[INFO] Latest complete: {traj_id} | score={score:.5f}", flush=True)
 
+    print("[STAGE 9/9] Aggregating metrics + writing artifacts", flush=True)
     df = pd.DataFrame.from_records(records)
     csv_path = paths["metrics"] / "per_trajectory_scores.csv"
     df.to_csv(csv_path, index=False)
@@ -680,6 +1096,16 @@ def main() -> None:
             "total_eval": int(2 * args.x),
         },
         "train_history": history,
+        "runtime_safety": {
+            "effective_batch_size": int(current_batch_size),
+            "oom_retries_used": int(oom_retries_used),
+            "max_visualizations_per_group": int(max_viz),
+        },
+        "prediction_quality": {
+            "id_validation_subset": val_quality,
+            "physical_ood": summarize_prediction_errors(records, "physical_ood"),
+            "non_physical": summarize_prediction_errors(records, "non_physical"),
+        },
         "surprise_stats": {
             "physical_ood": summarize_scores(physical_scores_np),
             "non_physical": summarize_scores(nonphysical_scores_np),
@@ -695,7 +1121,11 @@ def main() -> None:
         "artifacts": {
             "per_trajectory_scores_csv": str(csv_path),
             "plots_dir": str(output_dir / "plots"),
-            "gifs_dir": str(output_dir / "gifs"),
+            "gifs_dir": str(output_dir / "gifs") if args.save_gifs == 1 else None,
+            "rendered_png_count_physical_ood": int(physical_rendered),
+            "rendered_png_count_non_physical": int(nonphysical_rendered),
+            "rendered_gif_count_physical_ood": int(physical_rendered if args.save_gifs == 1 else 0),
+            "rendered_gif_count_non_physical": int(nonphysical_rendered if args.save_gifs == 1 else 0),
             "checkpoint": str(paths["checkpoints"] / "model.pt") if args.save_checkpoint == 1 else None,
         },
     }
@@ -704,17 +1134,19 @@ def main() -> None:
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"[INFO] Saved metrics: {summary_path}")
-    print(f"[INFO] Saved per-trajectory CSV: {csv_path}")
+    elapsed_sec = time.time() - run_start
+    print(f"[INFO] Saved metrics: {summary_path}", flush=True)
+    print(f"[INFO] Saved per-trajectory CSV: {csv_path}", flush=True)
     print(
         "[INFO] Surprise means | physical_ood={:.5f} | non_physical={:.5f} | delta={:.5f}".format(
             float(np.mean(physical_scores_np)),
             float(np.mean(nonphysical_scores_np)),
             float(np.mean(nonphysical_scores_np) - np.mean(physical_scores_np)),
-        )
+        ),
+        flush=True,
     )
-    print(f"[INFO] AUROC(non_physical positive)={auroc:.5f}")
-    print("[INFO] Done.")
+    print(f"[INFO] AUROC(non_physical positive)={auroc:.5f}", flush=True)
+    print(f"[INFO] Done. Total runtime: {elapsed_sec:.1f}s", flush=True)
 
 
 if __name__ == "__main__":
