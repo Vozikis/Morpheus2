@@ -7,8 +7,8 @@
 # - Pass them at submit time via sbatch flags.
 
 #SBATCH --job-name=freefall_surprise
-#SBATCH --output=slurm-%j.out
-#SBATCH --error=slurm-%j.err
+#SBATCH --output=/dev/null
+#SBATCH --error=/dev/null
 #SBATCH --partition=cees6000
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
