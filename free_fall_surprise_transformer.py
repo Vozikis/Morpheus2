@@ -583,7 +583,12 @@ def train_model(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     history = {"train_loss": [], "val_loss": [], "train_sigma_reg": [], "val_sigma_reg": []}
     use_amp = bool(amp and ctx.device.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    try:
+        # Preferred API in newer PyTorch versions.
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    except (AttributeError, TypeError):
+        # Backward-compatible fallback.
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     if is_main_process(ctx):
         print(
             "[INFO] Training setup | epochs={} train_batches={} val_batches={} lr={} amp={} sigma_reg_weight={} ddp={} world_size={}".format(

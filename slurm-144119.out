@@ -1,2 +1,0 @@
-[INFO] Python preflight OK | torch=2.5.1+cu121 cuda_available=True
-[INFO] Redirecting runtime stdout -> /ivi/zfs/s0/original_homes/avoziki/free_fall_surprise/runs/surprise_20260303_210819_144119/run_144119.out.txt
