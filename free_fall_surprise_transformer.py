@@ -75,10 +75,28 @@ def parse_args() -> argparse.Namespace:
         help="Maximum number of CUDA OOM retries with reduced batch size.",
     )
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate.")
+    parser.add_argument(
+        "--sigma_reg_weight",
+        type=float,
+        default=1e-3,
+        help="Regularization weight to penalize overly large predictive variance.",
+    )
     parser.add_argument("--d_model", type=int, default=128, help="Transformer d_model.")
     parser.add_argument("--nhead", type=int, default=8, help="Attention heads.")
     parser.add_argument("--num_layers", type=int, default=4, help="Encoder layers.")
     parser.add_argument("--dropout", type=float, default=0.1, help="Dropout.")
+    parser.add_argument(
+        "--log_sigma_min",
+        type=float,
+        default=-6.0,
+        help="Lower clamp bound for predicted log_sigma.",
+    )
+    parser.add_argument(
+        "--log_sigma_max",
+        type=float,
+        default=1.5,
+        help="Upper clamp bound for predicted log_sigma.",
+    )
     parser.add_argument(
         "--amp",
         type=int,
@@ -153,6 +171,13 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Safety cap on PNG/GIF renders per evaluation group. 0 means auto (= x).",
     )
+    parser.add_argument(
+        "--surprise_mode",
+        type=str,
+        default="rollout",
+        choices=["rollout", "teacher_forced"],
+        help="How surprise is computed: open-loop rollout or teacher-forced one-step.",
+    )
     args = parser.parse_args()
     if args.x <= 0:
         raise ValueError("--x must be > 0")
@@ -168,8 +193,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--min_batch_size cannot be larger than --batch_size")
     if args.oom_retries < 0:
         raise ValueError("--oom_retries must be >= 0")
+    if args.sigma_reg_weight < 0.0:
+        raise ValueError("--sigma_reg_weight must be >= 0")
     if args.d_model % args.nhead != 0:
         raise ValueError("--d_model must be divisible by --nhead")
+    if args.log_sigma_max <= args.log_sigma_min:
+        raise ValueError("--log_sigma_max must be > --log_sigma_min")
     if args.gif_stride <= 0:
         raise ValueError("--gif_stride must be > 0")
     if args.quality_eval_samples <= 0:
@@ -481,10 +510,14 @@ class CausalTrajectoryTransformer(nn.Module):
         num_layers: int,
         dropout: float,
         max_seq_len: int,
+        log_sigma_min: float = -6.0,
+        log_sigma_max: float = 1.5,
     ):
         super().__init__()
         self.input_proj = nn.Linear(2, d_model)
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+        self.log_sigma_min = float(log_sigma_min)
+        self.log_sigma_max = float(log_sigma_max)
         layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
@@ -507,7 +540,7 @@ class CausalTrajectoryTransformer(nn.Module):
         h = self.encoder(h, mask=causal_mask)
         out = self.head(h)
         mu = out[..., :2]
-        log_sigma = out[..., 2:].clamp(min=-6.0, max=4.0)
+        log_sigma = out[..., 2:].clamp(min=self.log_sigma_min, max=self.log_sigma_max)
         return mu, log_sigma
 
 
@@ -545,15 +578,23 @@ def train_model(
     epochs: int,
     lr: float,
     amp: bool,
+    sigma_reg_weight: float,
 ) -> Dict[str, List[float]]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    history = {"train_loss": [], "val_loss": []}
+    history = {"train_loss": [], "val_loss": [], "train_sigma_reg": [], "val_sigma_reg": []}
     use_amp = bool(amp and ctx.device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     if is_main_process(ctx):
         print(
-            "[INFO] Training setup | epochs={} train_batches={} val_batches={} lr={} amp={} ddp={} world_size={}".format(
-                epochs, len(train_loader), len(val_loader), lr, int(use_amp), int(ctx.use_ddp), ctx.world_size
+            "[INFO] Training setup | epochs={} train_batches={} val_batches={} lr={} amp={} sigma_reg_weight={} ddp={} world_size={}".format(
+                epochs,
+                len(train_loader),
+                len(val_loader),
+                lr,
+                int(use_amp),
+                sigma_reg_weight,
+                int(ctx.use_ddp),
+                ctx.world_size,
             ),
             flush=True,
         )
@@ -563,6 +604,7 @@ def train_model(
             train_sampler.set_epoch(epoch)
         model.train()
         train_loss_sum = 0.0
+        train_sigma_reg_sum = 0.0
         train_count = 0
         for x_batch, y_batch in train_loader:
             x_batch = x_batch.to(ctx.device)
@@ -570,7 +612,9 @@ def train_model(
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=ctx.device.type, dtype=torch.float16, enabled=use_amp):
                 mu, log_sigma = model(x_batch)
-                loss = gaussian_nll_loss(mu, log_sigma, y_batch)
+                nll_loss = gaussian_nll_loss(mu, log_sigma, y_batch)
+                sigma_reg = torch.exp(2.0 * log_sigma).mean()
+                loss = nll_loss + sigma_reg_weight * sigma_reg
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -584,11 +628,13 @@ def train_model(
                 optimizer.step()
 
             bs = x_batch.shape[0]
-            train_loss_sum += float(loss.item()) * bs
+            train_loss_sum += float(nll_loss.item()) * bs
+            train_sigma_reg_sum += float(sigma_reg.item()) * bs
             train_count += bs
 
         model.eval()
         val_loss_sum = 0.0
+        val_sigma_reg_sum = 0.0
         val_count = 0
         with torch.no_grad():
             for x_batch, y_batch in val_loader:
@@ -596,32 +642,40 @@ def train_model(
                 y_batch = y_batch.to(ctx.device)
                 with torch.autocast(device_type=ctx.device.type, dtype=torch.float16, enabled=use_amp):
                     mu, log_sigma = model(x_batch)
-                    loss = gaussian_nll_loss(mu, log_sigma, y_batch)
+                    nll_loss = gaussian_nll_loss(mu, log_sigma, y_batch)
+                    sigma_reg = torch.exp(2.0 * log_sigma).mean()
                 bs = x_batch.shape[0]
-                val_loss_sum += float(loss.item()) * bs
+                val_loss_sum += float(nll_loss.item()) * bs
+                val_sigma_reg_sum += float(sigma_reg.item()) * bs
                 val_count += bs
 
         train_loss_sum = allreduce_sum(train_loss_sum, ctx.device, ctx.use_ddp)
+        train_sigma_reg_sum = allreduce_sum(train_sigma_reg_sum, ctx.device, ctx.use_ddp)
         val_loss_sum = allreduce_sum(val_loss_sum, ctx.device, ctx.use_ddp)
+        val_sigma_reg_sum = allreduce_sum(val_sigma_reg_sum, ctx.device, ctx.use_ddp)
         train_count = int(allreduce_sum(float(train_count), ctx.device, ctx.use_ddp))
         val_count = int(allreduce_sum(float(val_count), ctx.device, ctx.use_ddp))
 
         train_loss = train_loss_sum / max(train_count, 1)
+        train_sigma_reg = train_sigma_reg_sum / max(train_count, 1)
         val_loss = val_loss_sum / max(val_count, 1)
+        val_sigma_reg = val_sigma_reg_sum / max(val_count, 1)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        history["train_sigma_reg"].append(train_sigma_reg)
+        history["val_sigma_reg"].append(val_sigma_reg)
 
         if is_main_process(ctx) and (epoch == 1 or epoch % max(1, epochs // 10) == 0 or epoch == epochs):
             pct = 100.0 * float(epoch) / float(max(epochs, 1))
             print(
-                f"[Epoch {epoch:03d}/{epochs}] ({pct:.1f}%) train_nll={train_loss:.5f} val_nll={val_loss:.5f}",
+                f"[Epoch {epoch:03d}/{epochs}] ({pct:.1f}%) train_nll={train_loss:.5f} val_nll={val_loss:.5f} train_sigma={train_sigma_reg:.5f} val_sigma={val_sigma_reg:.5f}",
                 flush=True,
             )
 
     return history
 
 
-def score_single_trajectory(
+def score_single_trajectory_teacher_forced(
     model: nn.Module,
     trajectory: np.ndarray,
     stats: NormStats,
@@ -656,6 +710,76 @@ def score_single_trajectory(
         "actual": actual,
         "time": time,
     }
+
+
+def score_single_trajectory_rollout(
+    model: nn.Module,
+    trajectory: np.ndarray,
+    stats: NormStats,
+    device: torch.device,
+) -> Dict[str, np.ndarray | float]:
+    norm_traj = normalize_trajectories(trajectory[None, ...], stats=stats)[0]
+    total_steps = norm_traj.shape[0] - 1
+
+    generated_inputs: List[np.ndarray] = [norm_traj[0].astype(np.float32)]
+    pred_norm_steps: List[np.ndarray] = []
+    nll_steps_list: List[float] = []
+
+    with torch.no_grad():
+        for step in range(total_steps):
+            x_np = np.asarray(generated_inputs, dtype=np.float32)
+            x = torch.from_numpy(x_np).unsqueeze(0).to(device)
+            mu_seq, log_sigma_seq = model(x)
+            mu_next = mu_seq[0, -1, :]
+            log_sigma_next = log_sigma_seq[0, -1, :]
+            y_true_next = torch.from_numpy(norm_traj[step + 1]).float().to(device)
+
+            inv_var = torch.exp(-2.0 * log_sigma_next)
+            sq = (y_true_next - mu_next) ** 2
+            nll_step = (0.5 * sq * inv_var + log_sigma_next + 0.5 * LOG_2PI).sum()
+
+            mu_next_np64 = mu_next.detach().cpu().numpy().astype(np.float64)
+            mu_next_np32 = mu_next.detach().cpu().numpy().astype(np.float32)
+            pred_norm_steps.append(mu_next_np64)
+            generated_inputs.append(mu_next_np32)
+            nll_steps_list.append(float(nll_step.item()))
+
+    nll_steps = np.asarray(nll_steps_list, dtype=np.float64)
+    pred_norm = np.stack(pred_norm_steps, axis=0).astype(np.float64)
+    pred = pred_norm * stats.std + stats.mean
+    actual = trajectory[1:, :].astype(np.float64)
+    time = np.arange(actual.shape[0], dtype=np.float64)
+    err = pred - actual
+    rmse_pos = float(np.sqrt(np.mean(err[:, 0] ** 2)))
+    rmse_vel = float(np.sqrt(np.mean(err[:, 1] ** 2)))
+    mae_pos = float(np.mean(np.abs(err[:, 0])))
+    mae_vel = float(np.mean(np.abs(err[:, 1])))
+    return {
+        "surprise_mean_nll": float(np.mean(nll_steps)),
+        "surprise_std_nll": float(np.std(nll_steps)),
+        "rmse_pos": rmse_pos,
+        "rmse_vel": rmse_vel,
+        "mae_pos": mae_pos,
+        "mae_vel": mae_vel,
+        "nll_steps": nll_steps,
+        "pred": pred,
+        "actual": actual,
+        "time": time,
+    }
+
+
+def score_single_trajectory(
+    model: nn.Module,
+    trajectory: np.ndarray,
+    stats: NormStats,
+    device: torch.device,
+    mode: str,
+) -> Dict[str, np.ndarray | float]:
+    if mode == "teacher_forced":
+        return score_single_trajectory_teacher_forced(model, trajectory, stats, device)
+    if mode == "rollout":
+        return score_single_trajectory_rollout(model, trajectory, stats, device)
+    raise ValueError(f"Unknown scoring mode: {mode}")
 
 
 def save_overlay_png(path: Path, time: np.ndarray, actual: np.ndarray, pred: np.ndarray, title: str) -> None:
@@ -812,6 +936,7 @@ def evaluate_prediction_quality_subset(
     device: torch.device,
     max_samples: int,
     label: str,
+    scoring_mode: str,
 ) -> Dict[str, float]:
     n_total = int(trajectories.shape[0])
     n_eval = min(n_total, int(max_samples))
@@ -823,7 +948,7 @@ def evaluate_prediction_quality_subset(
     mae_vel_vals: List[float] = []
 
     for i in range(n_eval):
-        res = score_single_trajectory(model, trajectories[i], stats, device)
+        res = score_single_trajectory(model, trajectories[i], stats, device, mode=scoring_mode)
         rmse_pos_vals.append(float(res["rmse_pos"]))
         rmse_vel_vals.append(float(res["rmse_vel"]))
         mae_pos_vals.append(float(res["mae_pos"]))
@@ -869,7 +994,7 @@ def main() -> None:
         print(f"[INFO] Device: {device}", flush=True)
         print(f"[INFO] Output directory: {output_dir}", flush=True)
         print(
-            "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} d_model={} nhead={} num_layers={} amp={} multi_gpu={} world_size={} save_pngs={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
+            "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} sigma_reg_weight={} d_model={} nhead={} num_layers={} log_sigma_min={} log_sigma_max={} surprise_mode={} amp={} multi_gpu={} world_size={} save_pngs={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
                 args.x,
                 args.train_n,
                 args.val_n,
@@ -878,9 +1003,13 @@ def main() -> None:
                 args.epochs,
                 args.batch_size,
                 args.lr,
+                args.sigma_reg_weight,
                 args.d_model,
                 args.nhead,
                 args.num_layers,
+                args.log_sigma_min,
+                args.log_sigma_max,
+                args.surprise_mode,
                 args.amp,
                 args.multi_gpu,
                 ctx.world_size,
@@ -961,6 +1090,8 @@ def main() -> None:
             num_layers=args.num_layers,
             dropout=args.dropout,
             max_seq_len=args.seq_len - 1,
+            log_sigma_min=args.log_sigma_min,
+            log_sigma_max=args.log_sigma_max,
         ).to(device)
 
     def build_loaders(batch_size: int) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler]]:
@@ -1030,6 +1161,7 @@ def main() -> None:
                 epochs=args.epochs,
                 lr=args.lr,
                 amp=bool(args.amp),
+                sigma_reg_weight=float(args.sigma_reg_weight),
             )
             break
         except RuntimeError as exc:
@@ -1100,6 +1232,7 @@ def main() -> None:
         device=device,
         max_samples=args.quality_eval_samples,
         label="id_val_prediction_quality",
+        scoring_mode=args.surprise_mode,
     )
     print(
         "[INFO] ID validation quality | samples={} rmse_pos={:.4f} rmse_vel={:.4f} mae_pos={:.4f} mae_vel={:.4f}".format(
@@ -1135,7 +1268,9 @@ def main() -> None:
 
     # Physical OOD group
     for i in range(args.x):
-        res = score_single_trajectory(model_for_eval, phys_ood_traj[i], stats, device)
+        res = score_single_trajectory(
+            model_for_eval, phys_ood_traj[i], stats, device, mode=args.surprise_mode
+        )
         score = float(res["surprise_mean_nll"])
         physical_scores.append(score)
         traj_id = f"physical_ood_{i:04d}"
@@ -1186,7 +1321,9 @@ def main() -> None:
 
     # Non-physical group
     for i in range(args.x):
-        res = score_single_trajectory(model_for_eval, nonphys_traj[i], stats, device)
+        res = score_single_trajectory(
+            model_for_eval, nonphys_traj[i], stats, device, mode=args.surprise_mode
+        )
         score = float(res["surprise_mean_nll"])
         nonphysical_scores.append(score)
         traj_id = f"non_physical_{i:04d}"
