@@ -124,10 +124,6 @@ fi
 
 mkdir -p "$OUTPUT_DIR" "$RUN_DIR"
 
-# Save exact script snapshots used for this run.
-cp "${SCRIPT_DIR}/free_fall_surprise_transformer.py" "${RUN_DIR}/free_fall_surprise_transformer.py"
-cp "${SCRIPT_DIR}/run_free_fall_surprise.slurm.sh" "${RUN_DIR}/run_free_fall_surprise.slurm.sh"
-
 if [ "$SHELL_LOG_TO_OUTPUT_DIR" = "1" ]; then
   SHELL_OUT="${RUN_DIR}/${SHELL_LOG_PREFIX}.out.txt"
   SHELL_ERR="${RUN_DIR}/${SHELL_LOG_PREFIX}.err.txt"
