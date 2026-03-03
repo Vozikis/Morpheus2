@@ -327,11 +327,12 @@ def sample_physical_params(rng: np.random.Generator, mode: str) -> Dict[str, flo
             # Out-of-distribution but still physically plausible ball-drop settings.
             "g": float(rng.uniform(9.60, 10.00)),
             "y0": float(rng.uniform(25.0, 45.0)),
-            "v0": float(rng.uniform(-1.5, 1.5)),
+            "v0": float(rng.uniform(0.0, 1.5)),
             "mass": float(rng.uniform(0.02, 1.2)),
             "radius": float(rng.uniform(0.01, 0.15)),
-            "drag_coefficient": float(rng.uniform(0.20, 0.80)),
-            "air_density": float(rng.uniform(0.90, 1.35)),
+            # Keep these IID as requested.
+            "drag_coefficient": float(rng.uniform(0.35, 0.55)),
+            "air_density": float(rng.uniform(1.15, 1.30)),
             "noise_std": float(rng.uniform(0.002, 0.01)),
             "floor": 0.0,
         }
