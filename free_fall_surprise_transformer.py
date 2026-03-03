@@ -111,6 +111,13 @@ def parse_args() -> argparse.Namespace:
         help="Whether to generate per-trajectory GIF overlays.",
     )
     parser.add_argument(
+        "--save_pngs",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Whether to generate per-trajectory PNG overlays.",
+    )
+    parser.add_argument(
         "--gif_stride",
         type=int,
         default=1,
@@ -125,8 +132,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max_visualizations_per_group",
         type=int,
-        default=200,
-        help="Safety cap on PNG/GIF renders per evaluation group.",
+        default=0,
+        help="Safety cap on PNG/GIF renders per evaluation group. 0 means auto (= x).",
     )
     args = parser.parse_args()
     if args.x <= 0:
@@ -174,7 +181,7 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def ensure_dirs(output_dir: Path) -> Dict[str, Path]:
+def ensure_dirs(output_dir: Path, save_pngs: bool, save_gifs: bool) -> Dict[str, Path]:
     paths = {
         "root": output_dir,
         "metrics": output_dir / "metrics",
@@ -184,8 +191,15 @@ def ensure_dirs(output_dir: Path) -> Dict[str, Path]:
         "gifs_nonphysical": output_dir / "gifs" / "non_physical",
         "checkpoints": output_dir / "checkpoints",
     }
-    for p in paths.values():
-        p.mkdir(parents=True, exist_ok=True)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    paths["metrics"].mkdir(parents=True, exist_ok=True)
+    paths["checkpoints"].mkdir(parents=True, exist_ok=True)
+    if save_pngs:
+        paths["plots_physical"].mkdir(parents=True, exist_ok=True)
+        paths["plots_nonphysical"].mkdir(parents=True, exist_ok=True)
+    if save_gifs:
+        paths["gifs_physical"].mkdir(parents=True, exist_ok=True)
+        paths["gifs_nonphysical"].mkdir(parents=True, exist_ok=True)
     return paths
 
 
@@ -279,6 +293,7 @@ def generate_physical_dataset(
     mode: str,
     rng: np.random.Generator,
     progress_label: Optional[str] = None,
+    return_metadata: bool = True,
 ) -> Tuple[np.ndarray, List[Dict[str, float]]]:
     trajectories = np.zeros((n, seq_len, 2), dtype=np.float32)
     metadata: List[Dict[str, float]] = []
@@ -287,7 +302,8 @@ def generate_physical_dataset(
         params = sample_physical_params(rng, mode=mode)
         traj = simulate_physical_trajectory(seq_len=seq_len, dt=dt, params=params, rng=rng)
         trajectories[i] = traj
-        metadata.append(params)
+        if return_metadata:
+            metadata.append(params)
         if progress_label and ((i + 1) == 1 or (i + 1) % progress_stride == 0 or (i + 1) == n):
             log_progress(progress_label, i + 1, n)
     return trajectories, metadata
@@ -764,14 +780,14 @@ def main() -> None:
     set_seed(args.seed)
     device = resolve_device(args.device)
     output_dir = Path(args.output_dir).resolve()
-    paths = ensure_dirs(output_dir)
+    paths = ensure_dirs(output_dir, save_pngs=bool(args.save_pngs), save_gifs=bool(args.save_gifs))
     rng = np.random.default_rng(args.seed)
 
     print("[STAGE 1/9] Setup", flush=True)
     print(f"[INFO] Device: {device}", flush=True)
     print(f"[INFO] Output directory: {output_dir}", flush=True)
     print(
-        "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} d_model={} nhead={} num_layers={} amp={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
+        "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} d_model={} nhead={} num_layers={} amp={} save_pngs={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
             args.x,
             args.train_n,
             args.val_n,
@@ -784,6 +800,7 @@ def main() -> None:
             args.nhead,
             args.num_layers,
             args.amp,
+            args.save_pngs,
             args.save_gifs,
             args.max_visualizations_per_group,
             args.oom_retries,
@@ -801,6 +818,7 @@ def main() -> None:
         mode="train",
         rng=rng,
         progress_label="generate_train_physical",
+        return_metadata=False,
     )
     print("[INFO] Generating in-distribution physical validation trajectories...", flush=True)
     val_traj, _ = generate_physical_dataset(
@@ -810,6 +828,7 @@ def main() -> None:
         mode="train",
         rng=rng,
         progress_label="generate_val_physical",
+        return_metadata=False,
     )
     print("[INFO] Generating physical out-of-distribution evaluation trajectories...", flush=True)
     phys_ood_traj, phys_ood_meta = generate_physical_dataset(
@@ -819,6 +838,7 @@ def main() -> None:
         mode="ood",
         rng=rng,
         progress_label="generate_eval_physical_ood",
+        return_metadata=True,
     )
     print("[INFO] Generating non-physical evaluation trajectories...", flush=True)
     nonphys_traj, nonphys_meta = generate_nonphysical_dataset(
@@ -965,12 +985,18 @@ def main() -> None:
     )
 
     print("[STAGE 8/9] Scoring + rendering trajectories", flush=True)
+    if args.save_pngs == 0:
+        print("[INFO] PNG rendering disabled (--save_pngs=0).", flush=True)
     if args.save_gifs == 0:
         print("[INFO] GIF rendering disabled (--save_gifs=0). PNG overlays will still be generated.", flush=True)
     records: List[Dict[str, object]] = []
     physical_scores: List[float] = []
     nonphysical_scores: List[float] = []
-    max_viz = int(args.max_visualizations_per_group)
+    max_viz = int(args.x if args.max_visualizations_per_group == 0 else min(args.max_visualizations_per_group, args.x))
+    print(
+        f"[INFO] Visualization plan | per_group={max_viz} (x={args.x}, cap_arg={args.max_visualizations_per_group})",
+        flush=True,
+    )
     physical_rendered = 0
     nonphysical_rendered = 0
     physical_viz_skip_notified = False
@@ -990,8 +1016,9 @@ def main() -> None:
         title = f"Physical OOD | {traj_id} | mean_nll={score:.4f}"
         should_render = i < max_viz
         if should_render:
-            save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
-            physical_rendered += 1
+            if args.save_pngs == 1:
+                save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
+            physical_rendered += int(args.save_pngs == 1)
             if args.save_gifs == 1:
                 save_overlay_gif(
                     gif_path,
@@ -1040,8 +1067,9 @@ def main() -> None:
         title = f"Non-Physical | {traj_id} | mean_nll={score:.4f}"
         should_render = i < max_viz
         if should_render:
-            save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
-            nonphysical_rendered += 1
+            if args.save_pngs == 1:
+                save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
+            nonphysical_rendered += int(args.save_pngs == 1)
             if args.save_gifs == 1:
                 save_overlay_gif(
                     gif_path,
@@ -1120,7 +1148,7 @@ def main() -> None:
         },
         "artifacts": {
             "per_trajectory_scores_csv": str(csv_path),
-            "plots_dir": str(output_dir / "plots"),
+            "plots_dir": str(output_dir / "plots") if args.save_pngs == 1 else None,
             "gifs_dir": str(output_dir / "gifs") if args.save_gifs == 1 else None,
             "rendered_png_count_physical_ood": int(physical_rendered),
             "rendered_png_count_non_physical": int(nonphysical_rendered),
