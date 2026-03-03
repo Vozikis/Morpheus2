@@ -308,45 +308,35 @@ def allreduce_sum(value: float, device: torch.device, enabled: bool) -> float:
     return float(t.item())
 
 
-def sample_disjoint_range(
-    rng: np.random.Generator, low_range: Tuple[float, float], high_range: Tuple[float, float]
-) -> float:
-    if rng.random() < 0.5:
-        return float(rng.uniform(low_range[0], low_range[1]))
-    return float(rng.uniform(high_range[0], high_range[1]))
-
-
 def sample_physical_params(rng: np.random.Generator, mode: str) -> Dict[str, float]:
     if mode == "train":
         params = {
-            "g": float(rng.uniform(8.5, 10.2)),
-            "y0": float(rng.uniform(5.0, 50.0)),
-            "v0": float(rng.uniform(-5.0, 5.0)),
-            "drag": float(rng.uniform(0.0, 0.08)),
-            "wind": float(rng.uniform(-0.3, 0.3)),
-            "noise_std": float(rng.uniform(0.0, 0.03)),
-            "floor": float(rng.uniform(-2.0, 2.0)),
-            "ceiling": float(rng.uniform(55.0, 70.0)),
-            "restitution": float(rng.uniform(0.55, 0.90)),
+            # Real-world-ish Earth gravity and ball properties for drop experiments.
+            "g": float(rng.uniform(9.78, 9.83)),
+            "y0": float(rng.uniform(1.0, 25.0)),  # release height (m)
+            "v0": float(rng.uniform(-0.3, 0.3)),  # release speed (m/s)
+            "mass": float(rng.uniform(0.05, 0.8)),  # kg
+            "radius": float(rng.uniform(0.02, 0.11)),  # m
+            "drag_coefficient": float(rng.uniform(0.35, 0.55)),  # sphere-like Cd range
+            "air_density": float(rng.uniform(1.15, 1.30)),  # kg/m^3
+            "noise_std": float(rng.uniform(0.0, 0.003)),
+            "floor": 0.0,
         }
     elif mode == "ood":
         params = {
-            "g": sample_disjoint_range(rng, (5.5, 7.2), (11.2, 13.5)),
-            "y0": float(rng.uniform(60.0, 100.0)),
-            "v0": sample_disjoint_range(rng, (-20.0, -8.0), (8.0, 20.0)),
-            "drag": float(rng.uniform(0.12, 0.30)),
-            "wind": sample_disjoint_range(rng, (-1.6, -0.6), (0.6, 1.6)),
-            "noise_std": float(rng.uniform(0.05, 0.15)),
-            "floor": float(rng.uniform(-10.0, -5.0)),
-            "ceiling": float(rng.uniform(110.0, 140.0)),
-            "restitution": float(rng.uniform(0.15, 0.45)),
+            # Out-of-distribution but still physically plausible ball-drop settings.
+            "g": float(rng.uniform(9.60, 10.00)),
+            "y0": float(rng.uniform(25.0, 45.0)),
+            "v0": float(rng.uniform(-1.5, 1.5)),
+            "mass": float(rng.uniform(0.02, 1.2)),
+            "radius": float(rng.uniform(0.01, 0.15)),
+            "drag_coefficient": float(rng.uniform(0.20, 0.80)),
+            "air_density": float(rng.uniform(0.90, 1.35)),
+            "noise_std": float(rng.uniform(0.002, 0.01)),
+            "floor": 0.0,
         }
     else:
         raise ValueError(f"Unknown mode: {mode}")
-
-    # Wall bounds included as metadata hooks for future >1D extensions.
-    params["wall_left"] = -100.0
-    params["wall_right"] = 100.0
     return params
 
 
@@ -358,26 +348,35 @@ def simulate_physical_trajectory(
     y[0] = float(params["y0"])
     v[0] = float(params["v0"])
     floor = float(params["floor"])
-    ceiling = float(params["ceiling"])
+    g = float(params["g"])
+    mass = max(float(params["mass"]), 1e-6)
+    radius = max(float(params["radius"]), 1e-6)
+    drag_coefficient = max(float(params["drag_coefficient"]), 0.0)
+    air_density = max(float(params["air_density"]), 0.0)
+    noise_std = float(params["noise_std"])
+
+    # Quadratic drag constant for 1D vertical motion.
+    area = math.pi * radius * radius
+    drag_k = 0.5 * air_density * drag_coefficient * area / mass
 
     for t in range(1, seq_len):
         prev_y = float(y[t - 1])
         prev_v = float(v[t - 1])
-        g = float(params["g"])
-        drag = float(params["drag"])
-        wind = float(params["wind"])
-        noise_std = float(params["noise_std"])
+        if prev_y <= floor + 1e-8 and abs(prev_v) <= 1e-6:
+            # Ball has landed and remains at rest on the ground.
+            y[t] = np.float32(floor)
+            v[t] = np.float32(0.0)
+            continue
 
-        acc = -g - drag * prev_v + wind
+        # a = -g - k v |v| (drag opposite to velocity).
+        acc = -g - drag_k * prev_v * abs(prev_v)
         v_new = prev_v + acc * dt + float(rng.normal(0.0, noise_std))
-        y_new = prev_y + v_new * dt + float(rng.normal(0.0, noise_std * 0.5))
+        y_new = prev_y + v_new * dt + float(rng.normal(0.0, noise_std * 0.25))
 
-        if y_new < floor:
-            y_new = floor + (floor - y_new)
-            v_new = abs(v_new) * float(params["restitution"])
-        elif y_new > ceiling:
-            y_new = ceiling - (y_new - ceiling)
-            v_new = -abs(v_new) * float(params["restitution"])
+        # Ground contact: no bounce for pure drop experiments.
+        if y_new <= floor:
+            y_new = floor
+            v_new = 0.0
 
         y[t] = np.float32(y_new)
         v[t] = np.float32(v_new)
