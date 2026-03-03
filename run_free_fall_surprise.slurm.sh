@@ -7,15 +7,16 @@
 # - Pass them at submit time via sbatch flags.
 
 #SBATCH --job-name=freefall_surprise
-#SBATCH --output=/dev/null
-#SBATCH --error=/dev/null
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+#SBATCH --account=ceesusers
 #SBATCH --partition=cees6000
+#SBATCH --gres=gpu:1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=64G
-#SBATCH --time=2-00:00:00
+#SBATCH --time=3-00:00:00
 
 set -euo pipefail
 
