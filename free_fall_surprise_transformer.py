@@ -17,6 +17,7 @@ import argparse
 import io
 import json
 import math
+import os
 import random
 import time
 from dataclasses import dataclass
@@ -32,7 +33,10 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 
 LOG_2PI = math.log(2.0 * math.pi)
@@ -81,6 +85,20 @@ def parse_args() -> argparse.Namespace:
         default=1,
         choices=[0, 1],
         help="Enable AMP mixed precision on CUDA.",
+    )
+    parser.add_argument(
+        "--multi_gpu",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Enable DDP multi-GPU when launched with torchrun and WORLD_SIZE>1.",
+    )
+    parser.add_argument(
+        "--ddp_backend",
+        type=str,
+        default="nccl",
+        choices=["nccl", "gloo"],
+        help="Distributed backend used for DDP.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument(
@@ -207,6 +225,58 @@ def ensure_dirs(output_dir: Path, save_pngs: bool, save_gifs: bool) -> Dict[str,
 class NormStats:
     mean: np.ndarray
     std: np.ndarray
+
+
+@dataclass
+class DistributedContext:
+    use_ddp: bool
+    rank: int
+    world_size: int
+    local_rank: int
+    device: torch.device
+
+
+def is_main_process(ctx: DistributedContext) -> bool:
+    return ctx.rank == 0
+
+
+def init_distributed(args: argparse.Namespace) -> DistributedContext:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_ddp = bool(args.multi_gpu == 1 and world_size > 1)
+
+    if use_ddp:
+        if args.device == "cpu":
+            raise RuntimeError("DDP multi-GPU requires CUDA device mode.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("DDP requested but CUDA is not available.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend=args.ddp_backend, init_method="env://")
+        device = torch.device("cuda", local_rank)
+    else:
+        device = resolve_device(args.device)
+
+    return DistributedContext(
+        use_ddp=use_ddp,
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        device=device,
+    )
+
+
+def cleanup_distributed(ctx: DistributedContext) -> None:
+    if ctx.use_ddp and dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def allreduce_sum(value: float, device: torch.device, enabled: bool) -> float:
+    if not enabled:
+        return value
+    t = torch.tensor([value], dtype=torch.float64, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return float(t.item())
 
 
 def sample_disjoint_range(
@@ -470,31 +540,35 @@ def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: DataLoader,
-    device: torch.device,
+    train_sampler: Optional[DistributedSampler],
+    ctx: DistributedContext,
     epochs: int,
     lr: float,
     amp: bool,
 ) -> Dict[str, List[float]]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     history = {"train_loss": [], "val_loss": []}
-    use_amp = bool(amp and device.type == "cuda")
+    use_amp = bool(amp and ctx.device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-    print(
-        "[INFO] Training setup | epochs={} train_batches={} val_batches={} lr={} amp={}".format(
-            epochs, len(train_loader), len(val_loader), lr, int(use_amp)
-        ),
-        flush=True,
-    )
+    if is_main_process(ctx):
+        print(
+            "[INFO] Training setup | epochs={} train_batches={} val_batches={} lr={} amp={} ddp={} world_size={}".format(
+                epochs, len(train_loader), len(val_loader), lr, int(use_amp), int(ctx.use_ddp), ctx.world_size
+            ),
+            flush=True,
+        )
 
     for epoch in range(1, epochs + 1):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         model.train()
         train_loss_sum = 0.0
         train_count = 0
         for x_batch, y_batch in train_loader:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+            x_batch = x_batch.to(ctx.device)
+            y_batch = y_batch.to(ctx.device)
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            with torch.autocast(device_type=ctx.device.type, dtype=torch.float16, enabled=use_amp):
                 mu, log_sigma = model(x_batch)
                 loss = gaussian_nll_loss(mu, log_sigma, y_batch)
 
@@ -518,21 +592,26 @@ def train_model(
         val_count = 0
         with torch.no_grad():
             for x_batch, y_batch in val_loader:
-                x_batch = x_batch.to(device)
-                y_batch = y_batch.to(device)
-                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                x_batch = x_batch.to(ctx.device)
+                y_batch = y_batch.to(ctx.device)
+                with torch.autocast(device_type=ctx.device.type, dtype=torch.float16, enabled=use_amp):
                     mu, log_sigma = model(x_batch)
                     loss = gaussian_nll_loss(mu, log_sigma, y_batch)
                 bs = x_batch.shape[0]
                 val_loss_sum += float(loss.item()) * bs
                 val_count += bs
 
+        train_loss_sum = allreduce_sum(train_loss_sum, ctx.device, ctx.use_ddp)
+        val_loss_sum = allreduce_sum(val_loss_sum, ctx.device, ctx.use_ddp)
+        train_count = int(allreduce_sum(float(train_count), ctx.device, ctx.use_ddp))
+        val_count = int(allreduce_sum(float(val_count), ctx.device, ctx.use_ddp))
+
         train_loss = train_loss_sum / max(train_count, 1)
         val_loss = val_loss_sum / max(val_count, 1)
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
 
-        if epoch == 1 or epoch % max(1, epochs // 10) == 0 or epoch == epochs:
+        if is_main_process(ctx) and (epoch == 1 or epoch % max(1, epochs // 10) == 0 or epoch == epochs):
             pct = 100.0 * float(epoch) / float(max(epochs, 1))
             print(
                 f"[Epoch {epoch:03d}/{epochs}] ({pct:.1f}%) train_nll={train_loss:.5f} val_nll={val_loss:.5f}",
@@ -777,91 +856,103 @@ def cohen_d(a: np.ndarray, b: np.ndarray) -> float:
 def main() -> None:
     run_start = time.time()
     args = parse_args()
+    ctx = init_distributed(args)
     set_seed(args.seed)
-    device = resolve_device(args.device)
+    device = ctx.device
+    main_proc = is_main_process(ctx)
     output_dir = Path(args.output_dir).resolve()
     paths = ensure_dirs(output_dir, save_pngs=bool(args.save_pngs), save_gifs=bool(args.save_gifs))
     rng = np.random.default_rng(args.seed)
 
-    print("[STAGE 1/9] Setup", flush=True)
-    print(f"[INFO] Device: {device}", flush=True)
-    print(f"[INFO] Output directory: {output_dir}", flush=True)
-    print(
-        "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} d_model={} nhead={} num_layers={} amp={} save_pngs={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
-            args.x,
-            args.train_n,
-            args.val_n,
-            args.seq_len,
-            args.dt,
-            args.epochs,
-            args.batch_size,
-            args.lr,
-            args.d_model,
-            args.nhead,
-            args.num_layers,
-            args.amp,
-            args.save_pngs,
-            args.save_gifs,
-            args.max_visualizations_per_group,
-            args.oom_retries,
-            args.min_batch_size,
-        ),
-        flush=True,
-    )
+    if main_proc:
+        print("[STAGE 1/9] Setup", flush=True)
+        print(f"[INFO] Device: {device}", flush=True)
+        print(f"[INFO] Output directory: {output_dir}", flush=True)
+        print(
+            "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} d_model={} nhead={} num_layers={} amp={} multi_gpu={} world_size={} save_pngs={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
+                args.x,
+                args.train_n,
+                args.val_n,
+                args.seq_len,
+                args.dt,
+                args.epochs,
+                args.batch_size,
+                args.lr,
+                args.d_model,
+                args.nhead,
+                args.num_layers,
+                args.amp,
+                args.multi_gpu,
+                ctx.world_size,
+                args.save_pngs,
+                args.save_gifs,
+                args.max_visualizations_per_group,
+                args.oom_retries,
+                args.min_batch_size,
+            ),
+            flush=True,
+        )
 
-    print("[STAGE 2/9] Generating datasets", flush=True)
-    print("[INFO] Generating in-distribution physical training trajectories...", flush=True)
+    if main_proc:
+        print("[STAGE 2/9] Generating datasets", flush=True)
+        print("[INFO] Generating in-distribution physical training trajectories...", flush=True)
     train_traj, _ = generate_physical_dataset(
         args.train_n,
         args.seq_len,
         args.dt,
         mode="train",
         rng=rng,
-        progress_label="generate_train_physical",
+        progress_label="generate_train_physical" if main_proc else None,
         return_metadata=False,
     )
-    print("[INFO] Generating in-distribution physical validation trajectories...", flush=True)
+    if main_proc:
+        print("[INFO] Generating in-distribution physical validation trajectories...", flush=True)
     val_traj, _ = generate_physical_dataset(
         args.val_n,
         args.seq_len,
         args.dt,
         mode="train",
         rng=rng,
-        progress_label="generate_val_physical",
+        progress_label="generate_val_physical" if main_proc else None,
         return_metadata=False,
     )
-    print("[INFO] Generating physical out-of-distribution evaluation trajectories...", flush=True)
+    if main_proc:
+        print("[INFO] Generating physical out-of-distribution evaluation trajectories...", flush=True)
     phys_ood_traj, phys_ood_meta = generate_physical_dataset(
         args.x,
         args.seq_len,
         args.dt,
         mode="ood",
         rng=rng,
-        progress_label="generate_eval_physical_ood",
+        progress_label="generate_eval_physical_ood" if main_proc else None,
         return_metadata=True,
     )
-    print("[INFO] Generating non-physical evaluation trajectories...", flush=True)
+    if main_proc:
+        print("[INFO] Generating non-physical evaluation trajectories...", flush=True)
     nonphys_traj, nonphys_meta = generate_nonphysical_dataset(
         args.x,
         args.seq_len,
         args.dt,
         rng=rng,
-        progress_label="generate_eval_non_physical",
+        progress_label="generate_eval_non_physical" if main_proc else None,
     )
 
-    print("[STAGE 3/9] Normalization and data loaders", flush=True)
+    if main_proc:
+        print("[STAGE 3/9] Normalization and data loaders", flush=True)
     stats = compute_norm_stats(train_traj)
     train_norm = normalize_trajectories(train_traj, stats)
     val_norm = normalize_trajectories(val_traj, stats)
 
     train_ds = TrajectoryDataset(train_norm)
     val_ds = TrajectoryDataset(val_norm)
-    print(
-        f"[INFO] Dataset sizes | train={len(train_ds)} val={len(val_ds)} eval_total={2 * args.x}",
-        flush=True,
-    )
+    if main_proc:
+        print(
+            f"[INFO] Dataset sizes | train={len(train_ds)} val={len(val_ds)} eval_total={2 * args.x}",
+            flush=True,
+        )
 
-    print("[STAGE 4/9] Model initialization", flush=True)
+    if main_proc:
+        print("[STAGE 4/9] Model initialization", flush=True)
 
     def build_model() -> CausalTrajectoryTransformer:
         return CausalTrajectoryTransformer(
@@ -872,12 +963,32 @@ def main() -> None:
             max_seq_len=args.seq_len - 1,
         ).to(device)
 
-    def build_loaders(batch_size: int) -> Tuple[DataLoader, DataLoader]:
+    def build_loaders(batch_size: int) -> Tuple[DataLoader, DataLoader, Optional[DistributedSampler]]:
+        train_sampler: Optional[DistributedSampler] = None
+        val_sampler: Optional[DistributedSampler] = None
+        if ctx.use_ddp:
+            train_sampler = DistributedSampler(
+                train_ds,
+                num_replicas=ctx.world_size,
+                rank=ctx.rank,
+                shuffle=True,
+                seed=args.seed,
+                drop_last=False,
+            )
+            val_sampler = DistributedSampler(
+                val_ds,
+                num_replicas=ctx.world_size,
+                rank=ctx.rank,
+                shuffle=False,
+                seed=args.seed,
+                drop_last=False,
+            )
         loader_gen = torch.Generator().manual_seed(args.seed)
         train_loader_local = DataLoader(
             train_ds,
             batch_size=batch_size,
-            shuffle=True,
+            shuffle=(train_sampler is None),
+            sampler=train_sampler,
             drop_last=False,
             generator=loader_gen,
             num_workers=0,
@@ -886,30 +997,36 @@ def main() -> None:
             val_ds,
             batch_size=batch_size,
             shuffle=False,
+            sampler=val_sampler,
             drop_last=False,
             num_workers=0,
         )
-        return train_loader_local, val_loader_local
+        return train_loader_local, val_loader_local, train_sampler
 
-    print("[STAGE 5/9] Training transformer on physical-only trajectories", flush=True)
+    if main_proc:
+        print("[STAGE 5/9] Training transformer on physical-only trajectories", flush=True)
     current_batch_size = int(args.batch_size)
-    model: Optional[CausalTrajectoryTransformer] = None
+    model: Optional[nn.Module] = None
     history: Dict[str, List[float]] = {"train_loss": [], "val_loss": []}
     oom_retries_used = 0
 
     while True:
         model = build_model()
-        train_loader, val_loader = build_loaders(current_batch_size)
-        print(
-            f"[INFO] Training attempt {oom_retries_used + 1} | batch_size={current_batch_size}",
-            flush=True,
-        )
+        if ctx.use_ddp:
+            model = DDP(model, device_ids=[ctx.local_rank], output_device=ctx.local_rank, find_unused_parameters=False)
+        train_loader, val_loader, train_sampler = build_loaders(current_batch_size)
+        if main_proc:
+            print(
+                f"[INFO] Training attempt {oom_retries_used + 1} | batch_size={current_batch_size}",
+                flush=True,
+            )
         try:
             history = train_model(
                 model=model,
                 train_loader=train_loader,
                 val_loader=val_loader,
-                device=device,
+                train_sampler=train_sampler,
+                ctx=ctx,
                 epochs=args.epochs,
                 lr=args.lr,
                 amp=bool(args.amp),
@@ -920,6 +1037,7 @@ def main() -> None:
             is_oom = "out of memory" in msg or "cuda error: out of memory" in msg
             can_retry = (
                 device.type == "cuda"
+                and not ctx.use_ddp
                 and is_oom
                 and oom_retries_used < args.oom_retries
                 and current_batch_size > args.min_batch_size
@@ -930,27 +1048,31 @@ def main() -> None:
             if next_batch_size == current_batch_size:
                 raise
             oom_retries_used += 1
-            print(
-                f"[WARN] CUDA OOM detected. Retrying with smaller batch size: {current_batch_size} -> {next_batch_size}",
-                flush=True,
-            )
+            if main_proc:
+                print(
+                    f"[WARN] CUDA OOM detected. Retrying with smaller batch size: {current_batch_size} -> {next_batch_size}",
+                    flush=True,
+                )
             if device.type == "cuda":
                 torch.cuda.empty_cache()
             current_batch_size = next_batch_size
 
-    print(
-        f"[INFO] Training completed with effective_batch_size={current_batch_size} oom_retries_used={oom_retries_used}",
-        flush=True,
-    )
+    if main_proc:
+        print(
+            f"[INFO] Training completed with effective_batch_size={current_batch_size} oom_retries_used={oom_retries_used}",
+            flush=True,
+        )
 
-    print("[STAGE 6/9] Saving checkpoint (if enabled)", flush=True)
+    if main_proc:
+        print("[STAGE 6/9] Saving checkpoint (if enabled)", flush=True)
     if model is None:
         raise RuntimeError("Model was not initialized successfully.")
-    if args.save_checkpoint == 1:
+    model_for_eval: nn.Module = model.module if isinstance(model, DDP) else model
+    if main_proc and args.save_checkpoint == 1:
         ckpt_path = paths["checkpoints"] / "model.pt"
         torch.save(
             {
-                "state_dict": model.state_dict(),
+                "state_dict": model_for_eval.state_dict(),
                 "norm_mean": stats.mean.tolist(),
                 "norm_std": stats.std.tolist(),
                 "args": vars(args),
@@ -961,12 +1083,18 @@ def main() -> None:
             ckpt_path,
         )
         print(f"[INFO] Saved checkpoint: {ckpt_path}", flush=True)
-    else:
+    elif main_proc:
         print("[INFO] Checkpoint saving disabled.", flush=True)
+
+    if ctx.use_ddp:
+        dist.barrier()
+    if not main_proc:
+        cleanup_distributed(ctx)
+        return
 
     print("[STAGE 7/9] Sanity check: prediction quality on in-distribution validation subset", flush=True)
     val_quality = evaluate_prediction_quality_subset(
-        model=model,
+        model=model_for_eval,
         trajectories=val_traj,
         stats=stats,
         device=device,
@@ -1007,7 +1135,7 @@ def main() -> None:
 
     # Physical OOD group
     for i in range(args.x):
-        res = score_single_trajectory(model, phys_ood_traj[i], stats, device)
+        res = score_single_trajectory(model_for_eval, phys_ood_traj[i], stats, device)
         score = float(res["surprise_mean_nll"])
         physical_scores.append(score)
         traj_id = f"physical_ood_{i:04d}"
@@ -1058,7 +1186,7 @@ def main() -> None:
 
     # Non-physical group
     for i in range(args.x):
-        res = score_single_trajectory(model, nonphys_traj[i], stats, device)
+        res = score_single_trajectory(model_for_eval, nonphys_traj[i], stats, device)
         score = float(res["surprise_mean_nll"])
         nonphysical_scores.append(score)
         traj_id = f"non_physical_{i:04d}"
@@ -1175,6 +1303,7 @@ def main() -> None:
     )
     print(f"[INFO] AUROC(non_physical positive)={auroc:.5f}", flush=True)
     print(f"[INFO] Done. Total runtime: {elapsed_sec:.1f}s", flush=True)
+    cleanup_distributed(ctx)
 
 
 if __name__ == "__main__":
