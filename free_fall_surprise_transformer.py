@@ -376,13 +376,37 @@ def simulate_physical_trajectory(
 
         # Ground contact: no bounce for pure drop experiments.
         if y_new <= floor:
-            y_new = floor
-            v_new = 0.0
+            y[t] = np.float32(floor)
+            v[t] = np.float32(0.0)
+            if t + 1 < seq_len:
+                y[t + 1 :] = np.float32(floor)
+                v[t + 1 :] = np.float32(0.0)
+            break
 
         y[t] = np.float32(y_new)
         v[t] = np.float32(v_new)
 
     return np.stack([y, v], axis=-1).astype(np.float32)
+
+
+def compute_valid_prediction_steps(
+    trajectory: np.ndarray, floor: float = 0.0, eps: float = 1e-8
+) -> int:
+    """
+    Number of one-step predictions to evaluate (targets at t=1..t=valid_steps).
+    For free-fall, we stop at first ground contact (inclusive).
+    """
+    total_steps = int(trajectory.shape[0] - 1)
+    if total_steps <= 0:
+        return 0
+    y = trajectory[:, 0]
+    hit_idx = np.flatnonzero(y <= floor + eps)
+    if hit_idx.size == 0:
+        return total_steps
+    impact_t = int(hit_idx[0])
+    if impact_t <= 0:
+        return 1
+    return min(impact_t, total_steps)
 
 
 def generate_physical_dataset(
@@ -490,16 +514,30 @@ def generate_nonphysical_dataset(
 
 
 class TrajectoryDataset(Dataset):
-    def __init__(self, trajectories: np.ndarray):
+    def __init__(
+        self,
+        trajectories: np.ndarray,
+        floor: float = 0.0,
+        mask_source_trajectories: Optional[np.ndarray] = None,
+    ):
         # Input: t=0..T-2 ; Target: t=1..T-1
         self.inputs = torch.from_numpy(trajectories[:, :-1, :]).float()
         self.targets = torch.from_numpy(trajectories[:, 1:, :]).float()
+        n = trajectories.shape[0]
+        horizon = trajectories.shape[1] - 1
+        mask_source = trajectories if mask_source_trajectories is None else mask_source_trajectories
+        step_masks = np.zeros((n, horizon), dtype=np.float32)
+        for i in range(n):
+            valid_steps = compute_valid_prediction_steps(mask_source[i], floor=floor)
+            if valid_steps > 0:
+                step_masks[i, :valid_steps] = 1.0
+        self.step_masks = torch.from_numpy(step_masks).float()
 
     def __len__(self) -> int:
         return int(self.inputs.shape[0])
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.inputs[idx], self.targets[idx]
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return self.inputs[idx], self.targets[idx], self.step_masks[idx]
 
 
 class CausalTrajectoryTransformer(nn.Module):
@@ -553,8 +591,19 @@ def gaussian_nll_per_timestep(mu: torch.Tensor, log_sigma: torch.Tensor, y: torc
     return nll_feat.sum(dim=-1)
 
 
-def gaussian_nll_loss(mu: torch.Tensor, log_sigma: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    return gaussian_nll_per_timestep(mu, log_sigma, y).mean()
+def masked_mean(values: torch.Tensor, step_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if step_mask is None:
+        return values.mean()
+    mask = step_mask.to(dtype=values.dtype)
+    denom = mask.sum().clamp_min(1.0)
+    return (values * mask).sum() / denom
+
+
+def gaussian_nll_loss(
+    mu: torch.Tensor, log_sigma: torch.Tensor, y: torch.Tensor, step_mask: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    per_step = gaussian_nll_per_timestep(mu, log_sigma, y)
+    return masked_mean(per_step, step_mask=step_mask)
 
 
 def normalize_trajectories(trajectories: np.ndarray, stats: NormStats) -> np.ndarray:
@@ -611,14 +660,16 @@ def train_model(
         train_loss_sum = 0.0
         train_sigma_reg_sum = 0.0
         train_count = 0
-        for x_batch, y_batch in train_loader:
+        for x_batch, y_batch, step_mask in train_loader:
             x_batch = x_batch.to(ctx.device)
             y_batch = y_batch.to(ctx.device)
+            step_mask = step_mask.to(ctx.device)
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=ctx.device.type, dtype=torch.float16, enabled=use_amp):
                 mu, log_sigma = model(x_batch)
-                nll_loss = gaussian_nll_loss(mu, log_sigma, y_batch)
-                sigma_reg = torch.exp(2.0 * log_sigma).mean()
+                nll_loss = gaussian_nll_loss(mu, log_sigma, y_batch, step_mask=step_mask)
+                sigma_per_step = torch.exp(2.0 * log_sigma).mean(dim=-1)
+                sigma_reg = masked_mean(sigma_per_step, step_mask=step_mask)
                 loss = nll_loss + sigma_reg_weight * sigma_reg
 
             if use_amp:
@@ -642,13 +693,15 @@ def train_model(
         val_sigma_reg_sum = 0.0
         val_count = 0
         with torch.no_grad():
-            for x_batch, y_batch in val_loader:
+            for x_batch, y_batch, step_mask in val_loader:
                 x_batch = x_batch.to(ctx.device)
                 y_batch = y_batch.to(ctx.device)
+                step_mask = step_mask.to(ctx.device)
                 with torch.autocast(device_type=ctx.device.type, dtype=torch.float16, enabled=use_amp):
                     mu, log_sigma = model(x_batch)
-                    nll_loss = gaussian_nll_loss(mu, log_sigma, y_batch)
-                    sigma_reg = torch.exp(2.0 * log_sigma).mean()
+                    nll_loss = gaussian_nll_loss(mu, log_sigma, y_batch, step_mask=step_mask)
+                    sigma_per_step = torch.exp(2.0 * log_sigma).mean(dim=-1)
+                    sigma_reg = masked_mean(sigma_per_step, step_mask=step_mask)
                 bs = x_batch.shape[0]
                 val_loss_sum += float(nll_loss.item()) * bs
                 val_sigma_reg_sum += float(sigma_reg.item()) * bs
@@ -685,8 +738,22 @@ def score_single_trajectory_teacher_forced(
     trajectory: np.ndarray,
     stats: NormStats,
     device: torch.device,
+    floor: float = 0.0,
+    valid_steps: Optional[int] = None,
 ) -> Dict[str, np.ndarray | float]:
     norm_traj = normalize_trajectories(trajectory[None, ...], stats=stats)[0]
+    total_steps = int(norm_traj.shape[0] - 1)
+    effective_steps = int(
+        max(
+            1,
+            min(
+                total_steps,
+                valid_steps
+                if valid_steps is not None
+                else compute_valid_prediction_steps(trajectory, floor=floor),
+            ),
+        )
+    )
     x = torch.from_numpy(norm_traj[:-1, :]).float().unsqueeze(0).to(device)
     y = torch.from_numpy(norm_traj[1:, :]).float().unsqueeze(0).to(device)
 
@@ -695,8 +762,9 @@ def score_single_trajectory_teacher_forced(
         nll_steps = gaussian_nll_per_timestep(mu, log_sigma, y)[0].cpu().numpy().astype(np.float64)
         pred_norm = mu[0].cpu().numpy().astype(np.float64)
 
-    pred = pred_norm * stats.std + stats.mean
-    actual = trajectory[1:, :].astype(np.float64)
+    nll_steps = nll_steps[:effective_steps]
+    pred = (pred_norm * stats.std + stats.mean)[:effective_steps]
+    actual = trajectory[1:, :].astype(np.float64)[:effective_steps]
     time = np.arange(actual.shape[0], dtype=np.float64)
     err = pred - actual
     rmse_pos = float(np.sqrt(np.mean(err[:, 0] ** 2)))
@@ -722,16 +790,29 @@ def score_single_trajectory_rollout(
     trajectory: np.ndarray,
     stats: NormStats,
     device: torch.device,
+    floor: float = 0.0,
+    valid_steps: Optional[int] = None,
 ) -> Dict[str, np.ndarray | float]:
     norm_traj = normalize_trajectories(trajectory[None, ...], stats=stats)[0]
-    total_steps = norm_traj.shape[0] - 1
+    total_steps = int(norm_traj.shape[0] - 1)
+    effective_steps = int(
+        max(
+            1,
+            min(
+                total_steps,
+                valid_steps
+                if valid_steps is not None
+                else compute_valid_prediction_steps(trajectory, floor=floor),
+            ),
+        )
+    )
 
     generated_inputs: List[np.ndarray] = [norm_traj[0].astype(np.float32)]
     pred_norm_steps: List[np.ndarray] = []
     nll_steps_list: List[float] = []
 
     with torch.no_grad():
-        for step in range(total_steps):
+        for step in range(effective_steps):
             x_np = np.asarray(generated_inputs, dtype=np.float32)
             x = torch.from_numpy(x_np).unsqueeze(0).to(device)
             mu_seq, log_sigma_seq = model(x)
@@ -752,7 +833,7 @@ def score_single_trajectory_rollout(
     nll_steps = np.asarray(nll_steps_list, dtype=np.float64)
     pred_norm = np.stack(pred_norm_steps, axis=0).astype(np.float64)
     pred = pred_norm * stats.std + stats.mean
-    actual = trajectory[1:, :].astype(np.float64)
+    actual = trajectory[1:, :].astype(np.float64)[:effective_steps]
     time = np.arange(actual.shape[0], dtype=np.float64)
     err = pred - actual
     rmse_pos = float(np.sqrt(np.mean(err[:, 0] ** 2)))
@@ -779,11 +860,17 @@ def score_single_trajectory(
     stats: NormStats,
     device: torch.device,
     mode: str,
+    floor: float = 0.0,
+    valid_steps: Optional[int] = None,
 ) -> Dict[str, np.ndarray | float]:
     if mode == "teacher_forced":
-        return score_single_trajectory_teacher_forced(model, trajectory, stats, device)
+        return score_single_trajectory_teacher_forced(
+            model, trajectory, stats, device, floor=floor, valid_steps=valid_steps
+        )
     if mode == "rollout":
-        return score_single_trajectory_rollout(model, trajectory, stats, device)
+        return score_single_trajectory_rollout(
+            model, trajectory, stats, device, floor=floor, valid_steps=valid_steps
+        )
     raise ValueError(f"Unknown scoring mode: {mode}")
 
 
@@ -1077,8 +1164,8 @@ def main() -> None:
     train_norm = normalize_trajectories(train_traj, stats)
     val_norm = normalize_trajectories(val_traj, stats)
 
-    train_ds = TrajectoryDataset(train_norm)
-    val_ds = TrajectoryDataset(val_norm)
+    train_ds = TrajectoryDataset(train_norm, floor=0.0, mask_source_trajectories=train_traj)
+    val_ds = TrajectoryDataset(val_norm, floor=0.0, mask_source_trajectories=val_traj)
     if main_proc:
         print(
             f"[INFO] Dataset sizes | train={len(train_ds)} val={len(val_ds)} eval_total={2 * args.x}",
