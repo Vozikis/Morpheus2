@@ -908,9 +908,14 @@ def save_overlay_gif(
 ) -> None:
     if imageio is None:
         raise RuntimeError("Cannot save GIF: imageio is not available.")
-    frames: List[np.ndarray] = []
     total_steps = len(time)
-    for t_end in range(2, total_steps + 1, frame_stride):
+    if total_steps <= 0:
+        return
+
+    stride = max(1, int(frame_stride))
+    frames: List[np.ndarray] = []
+    last_t_end = 0
+    for t_end in range(1, total_steps + 1, stride):
         fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
         axes[0].plot(time[:t_end], actual[:t_end, 0], label="actual_pos", linewidth=2.0)
         axes[0].plot(time[:t_end], pred[:t_end, 0], label="pred_pos", linewidth=1.8, alpha=0.85)
@@ -933,8 +938,9 @@ def save_overlay_gif(
         buf.seek(0)
         frames.append(imageio.imread(buf))
         buf.close()
+        last_t_end = t_end
 
-    if (total_steps - 1) % frame_stride != 0:
+    if last_t_end != total_steps:
         # Ensure final state is included even with stride > 1.
         t_end = total_steps
         fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
@@ -958,6 +964,8 @@ def save_overlay_gif(
         frames.append(imageio.imread(buf))
         buf.close()
 
+    if not frames:
+        return
     imageio.mimsave(path, frames, duration=0.08)
 
 
@@ -1394,15 +1402,21 @@ def main() -> None:
                 save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
                 id_png_rendered += 1
             if args.save_gifs == 1:
-                save_overlay_gif(
-                    gif_path,
-                    res["time"],
-                    res["actual"],
-                    res["pred"],
-                    title,
-                    frame_stride=args.gif_stride,
-                )
-                id_gif_rendered += 1
+                try:
+                    save_overlay_gif(
+                        gif_path,
+                        res["time"],
+                        res["actual"],
+                        res["pred"],
+                        title,
+                        frame_stride=args.gif_stride,
+                    )
+                    id_gif_rendered += 1
+                except Exception as exc:
+                    print(
+                        f"[WARN] GIF render failed for {traj_id}: {exc}. Continuing without this GIF.",
+                        flush=True,
+                    )
         elif not id_viz_skip_notified:
             print(
                 f"[WARN] Visualization cap reached for in_distribution group (max={max_viz}). Remaining trajectories will be scored but not rendered.",
@@ -1448,15 +1462,21 @@ def main() -> None:
                 save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
                 physical_png_rendered += 1
             if args.save_gifs == 1:
-                save_overlay_gif(
-                    gif_path,
-                    res["time"],
-                    res["actual"],
-                    res["pred"],
-                    title,
-                    frame_stride=args.gif_stride,
-                )
-                physical_gif_rendered += 1
+                try:
+                    save_overlay_gif(
+                        gif_path,
+                        res["time"],
+                        res["actual"],
+                        res["pred"],
+                        title,
+                        frame_stride=args.gif_stride,
+                    )
+                    physical_gif_rendered += 1
+                except Exception as exc:
+                    print(
+                        f"[WARN] GIF render failed for {traj_id}: {exc}. Continuing without this GIF.",
+                        flush=True,
+                    )
         elif not physical_viz_skip_notified:
             print(
                 f"[WARN] Visualization cap reached for physical_ood group (max={max_viz}). Remaining trajectories will be scored but not rendered.",
@@ -1502,15 +1522,21 @@ def main() -> None:
                 save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
                 nonphysical_png_rendered += 1
             if args.save_gifs == 1:
-                save_overlay_gif(
-                    gif_path,
-                    res["time"],
-                    res["actual"],
-                    res["pred"],
-                    title,
-                    frame_stride=args.gif_stride,
-                )
-                nonphysical_gif_rendered += 1
+                try:
+                    save_overlay_gif(
+                        gif_path,
+                        res["time"],
+                        res["actual"],
+                        res["pred"],
+                        title,
+                        frame_stride=args.gif_stride,
+                    )
+                    nonphysical_gif_rendered += 1
+                except Exception as exc:
+                    print(
+                        f"[WARN] GIF render failed for {traj_id}: {exc}. Continuing without this GIF.",
+                        flush=True,
+                    )
         elif not nonphysical_viz_skip_notified:
             print(
                 f"[WARN] Visualization cap reached for non_physical group (max={max_viz}). Remaining trajectories will be scored but not rendered.",
