@@ -1568,6 +1568,22 @@ def main() -> None:
     df = pd.DataFrame.from_records(records)
     csv_path = paths["metrics"] / "per_trajectory_scores.csv"
     df.to_csv(csv_path, index=False)
+    score_txt_path = paths["metrics"] / "per_trajectory_scores.txt"
+    with score_txt_path.open("w", encoding="utf-8") as f:
+        for group in ("in_distribution", "physical_ood", "non_physical"):
+            group_df = df[df["group"] == group].sort_values("trajectory_id")
+            header = f"[SCORES] group={group} count={len(group_df)}"
+            print(header, flush=True)
+            f.write(header + "\n")
+            for row in group_df.itertuples(index=False):
+                line = (
+                    f"[SCORE] trajectory_id={row.trajectory_id} "
+                    f"group={row.group} "
+                    f"surprise_mean_nll={float(row.surprise_mean_nll):.6f} "
+                    f"surprise_std_nll={float(row.surprise_std_nll):.6f}"
+                )
+                print(line, flush=True)
+                f.write(line + "\n")
 
     id_scores_np = np.asarray(id_scores, dtype=np.float64)
     physical_scores_np = np.asarray(physical_scores, dtype=np.float64)
@@ -1616,6 +1632,7 @@ def main() -> None:
         },
         "artifacts": {
             "per_trajectory_scores_csv": str(csv_path),
+            "per_trajectory_scores_txt": str(score_txt_path),
             "plots_dir": str(output_dir / "plots") if args.save_pngs == 1 else None,
             "gifs_dir": str(output_dir / "gifs") if args.save_gifs == 1 else None,
             "rendered_png_count_in_distribution": int(id_png_rendered),
@@ -1635,6 +1652,7 @@ def main() -> None:
     elapsed_sec = time.time() - run_start
     print(f"[INFO] Saved metrics: {summary_path}", flush=True)
     print(f"[INFO] Saved per-trajectory CSV: {csv_path}", flush=True)
+    print(f"[INFO] Saved per-trajectory score text: {score_txt_path}", flush=True)
     print(
         "[INFO] Surprise means | in_distribution={:.5f} | physical_ood={:.5f} | non_physical={:.5f} | delta(non_physical-physical_ood)={:.5f}".format(
             float(np.mean(id_scores_np)),
