@@ -232,8 +232,10 @@ def ensure_dirs(output_dir: Path, save_pngs: bool, save_gifs: bool) -> Dict[str,
     paths = {
         "root": output_dir,
         "metrics": output_dir / "metrics",
+        "plots_id": output_dir / "plots" / "in_distribution",
         "plots_physical": output_dir / "plots" / "physical_ood",
         "plots_nonphysical": output_dir / "plots" / "non_physical",
+        "gifs_id": output_dir / "gifs" / "in_distribution",
         "gifs_physical": output_dir / "gifs" / "physical_ood",
         "gifs_nonphysical": output_dir / "gifs" / "non_physical",
         "checkpoints": output_dir / "checkpoints",
@@ -242,9 +244,11 @@ def ensure_dirs(output_dir: Path, save_pngs: bool, save_gifs: bool) -> Dict[str,
     paths["metrics"].mkdir(parents=True, exist_ok=True)
     paths["checkpoints"].mkdir(parents=True, exist_ok=True)
     if save_pngs:
+        paths["plots_id"].mkdir(parents=True, exist_ok=True)
         paths["plots_physical"].mkdir(parents=True, exist_ok=True)
         paths["plots_nonphysical"].mkdir(parents=True, exist_ok=True)
     if save_gifs:
+        paths["gifs_id"].mkdir(parents=True, exist_ok=True)
         paths["gifs_physical"].mkdir(parents=True, exist_ok=True)
         paths["gifs_nonphysical"].mkdir(parents=True, exist_ok=True)
     return paths
@@ -314,7 +318,7 @@ def sample_physical_params(rng: np.random.Generator, mode: str) -> Dict[str, flo
             # Real-world-ish Earth gravity and ball properties for drop experiments.
             "g": float(rng.uniform(9.78, 9.83)),
             "y0": float(rng.uniform(1.0, 25.0)),  # release height (m)
-            "v0": float(rng.uniform(-0.3, 0.3)),  # release speed (m/s)
+            "v0": float(rng.uniform(0.0, 5.0)),  # initial speed (m/s)
             "mass": float(rng.uniform(0.05, 0.8)),  # kg
             "radius": float(rng.uniform(0.02, 0.11)),  # m
             "drag_coefficient": float(rng.uniform(0.35, 0.55)),  # sphere-like Cd range
@@ -1138,6 +1142,17 @@ def main() -> None:
         return_metadata=False,
     )
     if main_proc:
+        print("[INFO] Generating in-distribution evaluation trajectories...", flush=True)
+    id_eval_traj, id_eval_meta = generate_physical_dataset(
+        args.x,
+        args.seq_len,
+        args.dt,
+        mode="train",
+        rng=rng,
+        progress_label="generate_eval_in_distribution" if main_proc else None,
+        return_metadata=True,
+    )
+    if main_proc:
         print("[INFO] Generating physical out-of-distribution evaluation trajectories...", flush=True)
     phys_ood_traj, phys_ood_meta = generate_physical_dataset(
         args.x,
@@ -1168,7 +1183,7 @@ def main() -> None:
     val_ds = TrajectoryDataset(val_norm, floor=0.0, mask_source_trajectories=val_traj)
     if main_proc:
         print(
-            f"[INFO] Dataset sizes | train={len(train_ds)} val={len(val_ds)} eval_total={2 * args.x}",
+            f"[INFO] Dataset sizes | train={len(train_ds)} val={len(val_ds)} eval_total={3 * args.x}",
             flush=True,
         )
 
@@ -1343,6 +1358,7 @@ def main() -> None:
     if args.save_gifs == 0:
         print("[INFO] GIF rendering disabled (--save_gifs=0). PNG overlays will still be generated.", flush=True)
     records: List[Dict[str, object]] = []
+    id_scores: List[float] = []
     physical_scores: List[float] = []
     nonphysical_scores: List[float] = []
     max_viz = int(args.x if args.max_visualizations_per_group == 0 else min(args.max_visualizations_per_group, args.x))
@@ -1350,13 +1366,70 @@ def main() -> None:
         f"[INFO] Visualization plan | per_group={max_viz} (x={args.x}, cap_arg={args.max_visualizations_per_group})",
         flush=True,
     )
-    physical_rendered = 0
-    nonphysical_rendered = 0
+    id_png_rendered = 0
+    id_gif_rendered = 0
+    physical_png_rendered = 0
+    physical_gif_rendered = 0
+    nonphysical_png_rendered = 0
+    nonphysical_gif_rendered = 0
+    id_viz_skip_notified = False
     physical_viz_skip_notified = False
     nonphysical_viz_skip_notified = False
-    eval_total = 2 * args.x
+    eval_total = 3 * args.x
     eval_done = 0
     eval_progress_stride = max(1, eval_total // 10)
+
+    # In-distribution group
+    for i in range(args.x):
+        res = score_single_trajectory(model_for_eval, id_eval_traj[i], stats, device, mode=args.surprise_mode)
+        score = float(res["surprise_mean_nll"])
+        id_scores.append(score)
+        traj_id = f"in_distribution_{i:04d}"
+        png_path = paths["plots_id"] / f"traj_{i:04d}.png"
+        gif_path = paths["gifs_id"] / f"traj_{i:04d}.gif"
+        title = f"In-Distribution | {traj_id} | mean_nll={score:.4f}"
+        should_render = i < max_viz
+        if should_render:
+            if args.save_pngs == 1:
+                save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
+                id_png_rendered += 1
+            if args.save_gifs == 1:
+                save_overlay_gif(
+                    gif_path,
+                    res["time"],
+                    res["actual"],
+                    res["pred"],
+                    title,
+                    frame_stride=args.gif_stride,
+                )
+                id_gif_rendered += 1
+        elif not id_viz_skip_notified:
+            print(
+                f"[WARN] Visualization cap reached for in_distribution group (max={max_viz}). Remaining trajectories will be scored but not rendered.",
+                flush=True,
+            )
+            id_viz_skip_notified = True
+
+        meta = dict(id_eval_meta[i])
+        meta["group"] = "in_distribution"
+        meta["is_physical"] = 1
+        records.append(
+            {
+                "trajectory_id": traj_id,
+                "group": "in_distribution",
+                "surprise_mean_nll": score,
+                "surprise_std_nll": float(res["surprise_std_nll"]),
+                "rmse_pos": float(res["rmse_pos"]),
+                "rmse_vel": float(res["rmse_vel"]),
+                "mae_pos": float(res["mae_pos"]),
+                "mae_vel": float(res["mae_vel"]),
+                "metadata_json": json.dumps(meta, sort_keys=True),
+            }
+        )
+        eval_done += 1
+        if eval_done == 1 or eval_done % eval_progress_stride == 0 or eval_done == eval_total:
+            log_progress("score_and_render", eval_done, eval_total)
+            print(f"[INFO] Latest complete: {traj_id} | score={score:.5f}", flush=True)
 
     # Physical OOD group
     for i in range(args.x):
@@ -1373,7 +1446,7 @@ def main() -> None:
         if should_render:
             if args.save_pngs == 1:
                 save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
-            physical_rendered += int(args.save_pngs == 1)
+                physical_png_rendered += 1
             if args.save_gifs == 1:
                 save_overlay_gif(
                     gif_path,
@@ -1383,6 +1456,7 @@ def main() -> None:
                     title,
                     frame_stride=args.gif_stride,
                 )
+                physical_gif_rendered += 1
         elif not physical_viz_skip_notified:
             print(
                 f"[WARN] Visualization cap reached for physical_ood group (max={max_viz}). Remaining trajectories will be scored but not rendered.",
@@ -1426,7 +1500,7 @@ def main() -> None:
         if should_render:
             if args.save_pngs == 1:
                 save_overlay_png(png_path, res["time"], res["actual"], res["pred"], title)
-            nonphysical_rendered += int(args.save_pngs == 1)
+                nonphysical_png_rendered += 1
             if args.save_gifs == 1:
                 save_overlay_gif(
                     gif_path,
@@ -1436,6 +1510,7 @@ def main() -> None:
                     title,
                     frame_stride=args.gif_stride,
                 )
+                nonphysical_gif_rendered += 1
         elif not nonphysical_viz_skip_notified:
             print(
                 f"[WARN] Visualization cap reached for non_physical group (max={max_viz}). Remaining trajectories will be scored but not rendered.",
@@ -1468,6 +1543,7 @@ def main() -> None:
     csv_path = paths["metrics"] / "per_trajectory_scores.csv"
     df.to_csv(csv_path, index=False)
 
+    id_scores_np = np.asarray(id_scores, dtype=np.float64)
     physical_scores_np = np.asarray(physical_scores, dtype=np.float64)
     nonphysical_scores_np = np.asarray(nonphysical_scores, dtype=np.float64)
     auroc = compute_auroc(neg_scores=physical_scores_np, pos_scores=nonphysical_scores_np)
@@ -1476,9 +1552,10 @@ def main() -> None:
         "config": vars(args),
         "device_used": str(device),
         "counts": {
+            "in_distribution": int(args.x),
             "physical_ood": int(args.x),
             "non_physical": int(args.x),
-            "total_eval": int(2 * args.x),
+            "total_eval": int(3 * args.x),
         },
         "train_history": history,
         "runtime_safety": {
@@ -1488,14 +1565,22 @@ def main() -> None:
         },
         "prediction_quality": {
             "id_validation_subset": val_quality,
+            "in_distribution": summarize_prediction_errors(records, "in_distribution"),
             "physical_ood": summarize_prediction_errors(records, "physical_ood"),
             "non_physical": summarize_prediction_errors(records, "non_physical"),
         },
         "surprise_stats": {
+            "in_distribution": summarize_scores(id_scores_np),
             "physical_ood": summarize_scores(physical_scores_np),
             "non_physical": summarize_scores(nonphysical_scores_np),
+            "delta_mean_physical_ood_minus_in_distribution": float(
+                np.mean(physical_scores_np) - np.mean(id_scores_np)
+            ),
             "delta_mean_nonphysical_minus_physical": float(
                 np.mean(nonphysical_scores_np) - np.mean(physical_scores_np)
+            ),
+            "delta_mean_nonphysical_minus_in_distribution": float(
+                np.mean(nonphysical_scores_np) - np.mean(id_scores_np)
             ),
             "delta_median_nonphysical_minus_physical": float(
                 np.median(nonphysical_scores_np) - np.median(physical_scores_np)
@@ -1507,10 +1592,12 @@ def main() -> None:
             "per_trajectory_scores_csv": str(csv_path),
             "plots_dir": str(output_dir / "plots") if args.save_pngs == 1 else None,
             "gifs_dir": str(output_dir / "gifs") if args.save_gifs == 1 else None,
-            "rendered_png_count_physical_ood": int(physical_rendered),
-            "rendered_png_count_non_physical": int(nonphysical_rendered),
-            "rendered_gif_count_physical_ood": int(physical_rendered if args.save_gifs == 1 else 0),
-            "rendered_gif_count_non_physical": int(nonphysical_rendered if args.save_gifs == 1 else 0),
+            "rendered_png_count_in_distribution": int(id_png_rendered),
+            "rendered_png_count_physical_ood": int(physical_png_rendered),
+            "rendered_png_count_non_physical": int(nonphysical_png_rendered),
+            "rendered_gif_count_in_distribution": int(id_gif_rendered),
+            "rendered_gif_count_physical_ood": int(physical_gif_rendered),
+            "rendered_gif_count_non_physical": int(nonphysical_gif_rendered),
             "checkpoint": str(paths["checkpoints"] / "model.pt") if args.save_checkpoint == 1 else None,
         },
     }
@@ -1523,7 +1610,8 @@ def main() -> None:
     print(f"[INFO] Saved metrics: {summary_path}", flush=True)
     print(f"[INFO] Saved per-trajectory CSV: {csv_path}", flush=True)
     print(
-        "[INFO] Surprise means | physical_ood={:.5f} | non_physical={:.5f} | delta={:.5f}".format(
+        "[INFO] Surprise means | in_distribution={:.5f} | physical_ood={:.5f} | non_physical={:.5f} | delta(non_physical-physical_ood)={:.5f}".format(
+            float(np.mean(id_scores_np)),
             float(np.mean(physical_scores_np)),
             float(np.mean(nonphysical_scores_np)),
             float(np.mean(nonphysical_scores_np) - np.mean(physical_scores_np)),

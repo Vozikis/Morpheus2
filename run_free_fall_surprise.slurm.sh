@@ -104,7 +104,7 @@ SEED="${SEED:-42}"
 DEVICE="${DEVICE:-auto}"                # auto | cpu | cuda
 SAVE_CHECKPOINT="${SAVE_CHECKPOINT:-1}" # 0 | 1
 SAVE_PNGS="${SAVE_PNGS:-1}"             # 0 | 1
-SAVE_GIFS="${SAVE_GIFS:-0}"             # 0 | 1
+SAVE_GIFS="${SAVE_GIFS:-1}"             # 0 | 1
 GIF_STRIDE="${GIF_STRIDE:-2}"           # >=1 (used when SAVE_GIFS=1)
 QUALITY_EVAL_SAMPLES="${QUALITY_EVAL_SAMPLES:-512}"
 MAX_VIS_PER_GROUP="${MAX_VIS_PER_GROUP:-0}" # 0 => auto (save exactly x per group)
