@@ -45,6 +45,12 @@ if importlib.util.find_spec("imageio") is None:
 print(f"[INFO] Python preflight OK | torch={torch.__version__} cuda_available={torch.cuda.is_available()}")
 PY
 
+if grep -q "per_trajectory_scores_txt" "${SCRIPT_DIR}/free_fall_surprise_transformer.py"; then
+  echo "[INFO] Script feature check: per-trajectory score logging is ENABLED in free_fall_surprise_transformer.py"
+else
+  echo "[WARN] Script feature check: per-trajectory score logging marker not found. You are likely running an older script."
+fi
+
 # -----------------------------
 # Runtime safety (cluster-friendly defaults)
 # -----------------------------
