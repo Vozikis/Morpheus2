@@ -14,7 +14,7 @@ def sample_physical_params(rng: np.random.Generator, mode: str) -> Dict[str, flo
             # Broad physical "foundation" range for 1D ball drop on Earth-like conditions.
             "g": float(rng.uniform(9.70, 9.90)),  # m/s^2
             "y0": float(rng.uniform(2.0, 80.0)),  # release height (m)
-            "v0": float(rng.uniform(0.0, 15.0)),  # initial upward speed (m/s)
+            "v0": float(rng.uniform(-15.0, 15.0)),  # initial vertical speed (m/s)
             "mass": float(rng.uniform(0.01, 5.0)),  # kg
             "radius": float(rng.uniform(0.005, 0.25)),  # m
             "drag_coefficient": float(rng.uniform(0.15, 1.20)),  # broad sphere-like Cd range
@@ -27,7 +27,7 @@ def sample_physical_params(rng: np.random.Generator, mode: str) -> Dict[str, flo
             # OOD physical tails: still lawful free-fall but shifted to harder extremes.
             "g": float(rng.uniform(9.45, 10.20)),
             "y0": float(rng.uniform(80.0, 180.0)),
-            "v0": float(rng.uniform(15.0, 35.0)),
+            "v0": float(rng.uniform(-35.0, 35.0)),
             "mass": float(rng.uniform(0.005, 8.0)),
             "radius": float(rng.uniform(0.003, 0.35)),
             # Keep these IID relative to training regime.
