@@ -89,7 +89,7 @@ if [ "$RUN_PROFILE" = "small" ]; then
   : "${LOG_SIGMA_MAX:=1.5}"
   : "${SURPRISE_MODE:=teacher_forced}"
   : "${AMP:=1}"
-  : "${MULTI_GPU:=0}"
+  : "${MULTI_GPU:=1}"
 elif [ "$RUN_PROFILE" = "foundation" ]; then
   : "${X:=50}"
   : "${TRAIN_N:=1500000}"
@@ -137,7 +137,7 @@ fi
 DDP_BACKEND="${DDP_BACKEND:-nccl}"
 MASTER_PORT="${MASTER_PORT:-$((12000 + (${SLURM_JOB_ID:-0} % 20000)))}"
 SEED="${SEED:-42}"
-DEVICE="${DEVICE:-auto}"                # auto | cpu | cuda
+DEVICE="${DEVICE:-cuda}"                # auto | cpu | cuda
 SAVE_CHECKPOINT="${SAVE_CHECKPOINT:-1}" # 0 | 1
 SAVE_PNGS="${SAVE_PNGS:-1}"             # 0 | 1
 SAVE_GIFS="${SAVE_GIFS:-1}"             # 0 | 1

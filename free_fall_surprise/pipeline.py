@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -175,24 +176,46 @@ def main() -> None:
                 seed=args.seed,
                 drop_last=False,
             )
+        pin_memory = device.type == "cuda"
+        if pin_memory:
+            host_cpus = os.cpu_count() or 1
+            per_rank_cpus = max(1, host_cpus // max(ctx.world_size, 1))
+            num_workers = min(8, max(2, per_rank_cpus // 2))
+            val_num_workers = max(1, num_workers // 2)
+        else:
+            num_workers = 0
+            val_num_workers = 0
         loader_gen = torch.Generator().manual_seed(args.seed)
-        train_loader_local = DataLoader(
-            train_ds,
-            batch_size=batch_size,
-            shuffle=(train_sampler is None),
-            sampler=train_sampler,
-            drop_last=False,
-            generator=loader_gen,
-            num_workers=0,
-        )
-        val_loader_local = DataLoader(
-            val_ds,
-            batch_size=batch_size,
-            shuffle=False,
-            sampler=val_sampler,
-            drop_last=False,
-            num_workers=0,
-        )
+        train_loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": (train_sampler is None),
+            "sampler": train_sampler,
+            "drop_last": False,
+            "generator": loader_gen,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+        }
+        val_loader_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": False,
+            "sampler": val_sampler,
+            "drop_last": False,
+            "num_workers": val_num_workers,
+            "pin_memory": pin_memory,
+        }
+        if num_workers > 0:
+            train_loader_kwargs["persistent_workers"] = True
+            train_loader_kwargs["prefetch_factor"] = 2
+        if val_num_workers > 0:
+            val_loader_kwargs["persistent_workers"] = True
+            val_loader_kwargs["prefetch_factor"] = 2
+        train_loader_local = DataLoader(train_ds, **train_loader_kwargs)
+        val_loader_local = DataLoader(val_ds, **val_loader_kwargs)
+        if main_proc:
+            print(
+                f"[INFO] DataLoader config | train_workers={num_workers} val_workers={val_num_workers} pin_memory={int(pin_memory)}",
+                flush=True,
+            )
         return train_loader_local, val_loader_local, train_sampler
 
     if main_proc:
