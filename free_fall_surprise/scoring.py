@@ -17,7 +17,8 @@ TARGET_ABS_EPS = 1e-8
 
 def valid_target_step_mask(targets: np.ndarray, eps: float = TARGET_ABS_EPS) -> np.ndarray:
     finite_mask = np.isfinite(targets).all(axis=-1)
-    non_zero_mask = (np.abs(targets) > eps).all(axis=-1)
+    # Keep steps where at least one channel is present/non-zero.
+    non_zero_mask = (np.abs(targets) > eps).any(axis=-1)
     return np.logical_and(finite_mask, non_zero_mask)
 
 

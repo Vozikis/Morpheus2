@@ -40,7 +40,8 @@ class TrajectoryDataset(Dataset):
         # Also drop steps where either target feature is missing/non-finite or zero-valued.
         raw_targets = mask_source[:, 1:, :]
         finite_mask = np.isfinite(raw_targets).all(axis=-1)
-        non_zero_mask = (np.abs(raw_targets) > TARGET_ABS_EPS).all(axis=-1)
+        # Keep the step if at least one channel carries signal.
+        non_zero_mask = (np.abs(raw_targets) > TARGET_ABS_EPS).any(axis=-1)
         step_masks *= np.logical_and(finite_mask, non_zero_mask).astype(np.float32)
         self.step_masks = torch.from_numpy(step_masks).float()
 
