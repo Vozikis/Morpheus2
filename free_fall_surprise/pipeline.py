@@ -19,10 +19,20 @@ from .config import parse_args
 from .data_generation import generate_nonphysical_dataset, generate_physical_dataset
 from .dataset import TrajectoryDataset, compute_norm_stats, normalize_trajectories
 from .distributed import cleanup_distributed, init_distributed, is_main_process
-from .metrics import cohen_d, compute_auroc, summarize_prediction_errors, summarize_scores
+from .metrics import (
+    cohen_d,
+    compute_auroc,
+    frechet_trajectory_distance,
+    summarize_prediction_errors,
+    summarize_scores,
+)
 from .model import CausalTrajectoryTransformer
 from .runtime import ensure_dirs, log_progress, set_seed
-from .scoring import evaluate_prediction_quality_subset, score_single_trajectory
+from .scoring import (
+    compute_trajectory_embeddings,
+    evaluate_prediction_quality_subset,
+    score_single_trajectory,
+)
 from .training import train_model
 from .visualization import save_overlay_gif, save_overlay_png
 
@@ -566,6 +576,27 @@ def main() -> None:
     physical_scores_np = np.asarray(physical_scores, dtype=np.float64)
     nonphysical_scores_np = np.asarray(nonphysical_scores, dtype=np.float64)
     auroc = compute_auroc(neg_scores=physical_scores_np, pos_scores=nonphysical_scores_np)
+    id_embeddings = compute_trajectory_embeddings(
+        model=model_for_eval,
+        trajectories=id_eval_traj,
+        stats=stats,
+        device=device,
+    )
+    physical_embeddings = compute_trajectory_embeddings(
+        model=model_for_eval,
+        trajectories=phys_ood_traj,
+        stats=stats,
+        device=device,
+    )
+    nonphysical_embeddings = compute_trajectory_embeddings(
+        model=model_for_eval,
+        trajectories=nonphys_traj,
+        stats=stats,
+        device=device,
+        valid_steps=args.seq_len - 1,
+    )
+    ftd_id_vs_physical = frechet_trajectory_distance(id_embeddings, physical_embeddings)
+    ftd_id_vs_nonphysical = frechet_trajectory_distance(id_embeddings, nonphysical_embeddings)
 
     summary = {
         "config": vars(args),
@@ -607,6 +638,14 @@ def main() -> None:
             "effect_size_cohen_d": cohen_d(physical_scores_np, nonphysical_scores_np),
             "auroc_nonphysical_as_positive": auroc,
         },
+        "trajectory_distribution_stats": {
+            "embedding": "transformer_encoder_mean_pool",
+            "embedding_dim": int(id_embeddings.shape[1]),
+            "frechet_trajectory_distance": {
+                "id_vs_physical_ood": float(ftd_id_vs_physical),
+                "id_vs_non_physical": float(ftd_id_vs_nonphysical),
+            },
+        },
         "artifacts": {
             "per_trajectory_scores_csv": str(csv_path),
             "per_trajectory_scores_txt": str(score_txt_path),
@@ -636,6 +675,13 @@ def main() -> None:
             float(np.mean(physical_scores_np)),
             float(np.mean(nonphysical_scores_np)),
             float(np.mean(nonphysical_scores_np) - np.mean(physical_scores_np)),
+        ),
+        flush=True,
+    )
+    print(
+        "[INFO] FTD | id_vs_physical_ood={:.5f} | id_vs_non_physical={:.5f}".format(
+            float(ftd_id_vs_physical),
+            float(ftd_id_vs_nonphysical),
         ),
         flush=True,
     )

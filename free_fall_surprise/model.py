@@ -36,20 +36,25 @@ class CausalTrajectoryTransformer(nn.Module):
         self.head = nn.Linear(d_model, 4)
         nn.init.normal_(self.pos_embed, mean=0.0, std=0.02)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # x: [B, T, 2]
-        bsz, steps, _ = x.shape
-        h = self.input_proj(x) + self.pos_embed[:, :steps, :]
-        idx = torch.arange(steps, device=x.device)
+    def _build_causal_mask(self, steps: int, device: torch.device) -> torch.Tensor:
+        idx = torch.arange(steps, device=device)
         q_pos = idx.view(-1, 1)
         k_pos = idx.view(1, -1)
         future_mask = k_pos > q_pos
         if self.context_window >= 0:
             too_old_mask = k_pos < (q_pos - self.context_window)
-            causal_mask = future_mask | too_old_mask
-        else:
-            causal_mask = future_mask
-        h = self.encoder(h, mask=causal_mask)
+            return future_mask | too_old_mask
+        return future_mask
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, 2] -> encoded hidden states [B, T, D]
+        _, steps, _ = x.shape
+        h = self.input_proj(x) + self.pos_embed[:, :steps, :]
+        causal_mask = self._build_causal_mask(steps=steps, device=x.device)
+        return self.encoder(h, mask=causal_mask)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.encode(x)
         out = self.head(h)
         mu = out[..., :2]
         log_sigma = out[..., 2:].clamp(min=self.log_sigma_min, max=self.log_sigma_max)

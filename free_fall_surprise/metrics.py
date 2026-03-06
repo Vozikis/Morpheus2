@@ -36,6 +36,69 @@ def compute_auroc(neg_scores: np.ndarray, pos_scores: np.ndarray) -> float:
     return float(auroc)
 
 
+def _symmetric_matrix_sqrt(matrix: np.ndarray) -> np.ndarray:
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("Matrix contains non-finite values.")
+    matrix = 0.5 * (matrix + matrix.T)
+    eigvals, eigvecs = np.linalg.eigh(matrix)
+    eigvals = np.clip(eigvals, a_min=0.0, a_max=None)
+    sqrt_diag = np.diag(np.sqrt(eigvals))
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        sqrt_matrix = eigvecs @ sqrt_diag @ eigvecs.T
+    return 0.5 * (sqrt_matrix + sqrt_matrix.T)
+
+
+def fit_gaussian(embeddings: np.ndarray) -> Dict[str, np.ndarray]:
+    if embeddings.ndim != 2:
+        raise ValueError("embeddings must be 2D [N, D]")
+    n, d = embeddings.shape
+    mean = np.mean(embeddings, axis=0).astype(np.float64)
+    if n > 1:
+        cov = np.cov(embeddings, rowvar=False).astype(np.float64)
+    else:
+        cov = np.zeros((d, d), dtype=np.float64)
+    return {"mean": mean, "cov": cov}
+
+
+def compute_frechet_distance(
+    mean_a: np.ndarray,
+    cov_a: np.ndarray,
+    mean_b: np.ndarray,
+    cov_b: np.ndarray,
+    eps: float = 1e-6,
+) -> float:
+    if mean_a.shape != mean_b.shape:
+        raise ValueError("Mean vectors must have identical shape.")
+    if cov_a.shape != cov_b.shape:
+        raise ValueError("Covariance matrices must have identical shape.")
+    d = cov_a.shape[0]
+    cov_a_reg = cov_a + np.eye(d, dtype=np.float64) * eps
+    cov_b_reg = cov_b + np.eye(d, dtype=np.float64) * eps
+    sqrt_cov_a = _symmetric_matrix_sqrt(cov_a_reg)
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        middle = sqrt_cov_a @ cov_b_reg @ sqrt_cov_a
+    sqrt_middle = _symmetric_matrix_sqrt(middle)
+    diff = mean_a - mean_b
+    distance = float(diff.dot(diff) + np.trace(cov_a_reg + cov_b_reg - 2.0 * sqrt_middle))
+    return max(0.0, distance)
+
+
+def frechet_trajectory_distance(
+    embeddings_a: np.ndarray,
+    embeddings_b: np.ndarray,
+    eps: float = 1e-6,
+) -> float:
+    ga = fit_gaussian(embeddings_a)
+    gb = fit_gaussian(embeddings_b)
+    return compute_frechet_distance(
+        mean_a=ga["mean"],
+        cov_a=ga["cov"],
+        mean_b=gb["mean"],
+        cov_b=gb["cov"],
+        eps=eps,
+    )
+
+
 def summarize_scores(scores: np.ndarray) -> Dict[str, float]:
     q25, q50, q75 = np.percentile(scores, [25.0, 50.0, 75.0])
     return {

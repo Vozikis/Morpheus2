@@ -8,6 +8,9 @@ import numpy as np
 from .runtime import log_progress
 
 
+TARGET_ABS_EPS = 1e-8
+
+
 def sample_physical_params(rng: np.random.Generator, mode: str) -> Dict[str, float]:
     if mode == "train":
         params = {
@@ -185,21 +188,40 @@ def generate_nonphysical_dataset(
     rng: np.random.Generator,
     progress_label: Optional[str] = None,
 ) -> Tuple[np.ndarray, List[Dict[str, float]]]:
+    def is_non_empty_nonphysical_trajectory(
+        trajectory: np.ndarray, eps: float = TARGET_ABS_EPS, min_signal_steps: int = 2
+    ) -> bool:
+        if not np.isfinite(trajectory).all():
+            return False
+        targets = trajectory[1:, :]
+        signal_steps = (np.abs(targets) > eps).any(axis=-1)
+        return int(signal_steps.sum()) >= int(min_signal_steps)
+
     trajectories = np.zeros((n, seq_len, 2), dtype=np.float32)
     metadata: List[Dict[str, float]] = []
     regimes = ["random_walk", "anti_gravity", "sinusoidal_forcing", "teleport_jump"]
     progress_stride = max(1, n // 10)
+    max_resample_attempts = 64
 
     for i in range(n):
-        regime = str(rng.choice(regimes))
-        if regime == "random_walk":
-            traj = generate_random_walk(seq_len, dt, rng)
-        elif regime == "anti_gravity":
-            traj = generate_anti_gravity(seq_len, dt, rng)
-        elif regime == "sinusoidal_forcing":
-            traj = generate_sinusoidal_forcing(seq_len, dt, rng)
-        else:
-            traj = generate_teleport_jump(seq_len, dt, rng)
+        attempts = 0
+        while True:
+            attempts += 1
+            regime = str(rng.choice(regimes))
+            if regime == "random_walk":
+                traj = generate_random_walk(seq_len, dt, rng)
+            elif regime == "anti_gravity":
+                traj = generate_anti_gravity(seq_len, dt, rng)
+            elif regime == "sinusoidal_forcing":
+                traj = generate_sinusoidal_forcing(seq_len, dt, rng)
+            else:
+                traj = generate_teleport_jump(seq_len, dt, rng)
+            if is_non_empty_nonphysical_trajectory(traj):
+                break
+            if attempts >= max_resample_attempts:
+                raise RuntimeError(
+                    f"Failed to generate a non-empty non-physical trajectory after {max_resample_attempts} attempts."
+                )
 
         trajectories[i] = traj
         metadata.append(

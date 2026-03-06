@@ -13,7 +13,6 @@ from .runtime import log_progress
 
 
 TARGET_ABS_EPS = 1e-8
-EMPTY_TRAJECTORY_NLL_PENALTY = 1e6
 
 
 def valid_target_step_mask(targets: np.ndarray, eps: float = TARGET_ABS_EPS) -> np.ndarray:
@@ -58,13 +57,10 @@ def score_single_trajectory_teacher_forced(
     time = np.arange(actual.shape[0], dtype=np.float64)
     step_mask = valid_target_step_mask(actual)
     err = pred - actual
-    if np.any(step_mask):
-        nll_eval = nll_steps[step_mask]
-        err_eval = err[step_mask]
-    else:
-        # Empty/missing trajectories should not receive spuriously low surprise.
-        nll_eval = np.asarray([EMPTY_TRAJECTORY_NLL_PENALTY], dtype=np.float64)
-        err_eval = err
+    if not np.any(step_mask):
+        raise ValueError("Encountered empty trajectory during scoring.")
+    nll_eval = nll_steps[step_mask]
+    err_eval = err[step_mask]
     rmse_pos = float(np.sqrt(np.mean(err_eval[:, 0] ** 2)))
     rmse_vel = float(np.sqrt(np.mean(err_eval[:, 1] ** 2)))
     mae_pos = float(np.mean(np.abs(err_eval[:, 0])))
@@ -135,13 +131,10 @@ def score_single_trajectory_rollout(
     time = np.arange(actual.shape[0], dtype=np.float64)
     step_mask = valid_target_step_mask(actual)
     err = pred - actual
-    if np.any(step_mask):
-        nll_eval = nll_steps[step_mask]
-        err_eval = err[step_mask]
-    else:
-        # Empty/missing trajectories should not receive spuriously low surprise.
-        nll_eval = np.asarray([EMPTY_TRAJECTORY_NLL_PENALTY], dtype=np.float64)
-        err_eval = err
+    if not np.any(step_mask):
+        raise ValueError("Encountered empty trajectory during scoring.")
+    nll_eval = nll_steps[step_mask]
+    err_eval = err[step_mask]
     rmse_pos = float(np.sqrt(np.mean(err_eval[:, 0] ** 2)))
     rmse_vel = float(np.sqrt(np.mean(err_eval[:, 1] ** 2)))
     mae_pos = float(np.mean(np.abs(err_eval[:, 0])))
@@ -178,6 +171,58 @@ def score_single_trajectory(
             model, trajectory, stats, device, floor=floor, valid_steps=valid_steps
         )
     raise ValueError(f"Unknown scoring mode: {mode}")
+
+
+def trajectory_embedding(
+    model: nn.Module,
+    trajectory: np.ndarray,
+    stats: NormStats,
+    device: torch.device,
+    floor: float = 0.0,
+    valid_steps: Optional[int] = None,
+) -> np.ndarray:
+    norm_traj = normalize_trajectories(trajectory[None, ...], stats=stats)[0]
+    total_steps = int(norm_traj.shape[0] - 1)
+    effective_steps = int(
+        max(
+            1,
+            min(
+                total_steps,
+                valid_steps
+                if valid_steps is not None
+                else compute_valid_prediction_steps(trajectory, floor=floor),
+            ),
+        )
+    )
+    x = torch.from_numpy(norm_traj[:effective_steps, :]).float().unsqueeze(0).to(device)
+    with torch.no_grad():
+        if not hasattr(model, "encode"):
+            raise AttributeError("Model must provide an encode(...) method for FTD embeddings.")
+        hidden = model.encode(x)
+        emb = hidden.mean(dim=1)[0].detach().cpu().numpy().astype(np.float64)
+    return emb
+
+
+def compute_trajectory_embeddings(
+    model: nn.Module,
+    trajectories: np.ndarray,
+    stats: NormStats,
+    device: torch.device,
+    floor: float = 0.0,
+    valid_steps: Optional[int] = None,
+) -> np.ndarray:
+    embeddings: List[np.ndarray] = []
+    for traj in trajectories:
+        emb = trajectory_embedding(
+            model=model,
+            trajectory=traj,
+            stats=stats,
+            device=device,
+            floor=floor,
+            valid_steps=valid_steps,
+        )
+        embeddings.append(emb)
+    return np.stack(embeddings, axis=0).astype(np.float64)
 
 
 def evaluate_prediction_quality_subset(
