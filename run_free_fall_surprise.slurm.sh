@@ -67,7 +67,7 @@ ulimit -c 0
 # -----------------------------
 # User-tunable defaults
 # -----------------------------
-RUN_PROFILE="${RUN_PROFILE:-foundation}" # small | foundation
+RUN_PROFILE="${RUN_PROFILE:-small}" # small | foundation
 if [ "$RUN_PROFILE" = "small" ]; then
   : "${X:=10}"
   : "${TRAIN_N:=5000}"
