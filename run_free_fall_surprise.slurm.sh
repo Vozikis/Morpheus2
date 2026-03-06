@@ -67,27 +67,56 @@ ulimit -c 0
 # -----------------------------
 # User-tunable defaults
 # -----------------------------
-X="${X:-50}"
-TRAIN_N="${TRAIN_N:-1500000}"
-VAL_N="${VAL_N:-250000}"
-SEQ_LEN="${SEQ_LEN:-120}"
-DT="${DT:-0.04}"
-EPOCHS="${EPOCHS:-140}"
-BATCH_SIZE="${BATCH_SIZE:-32}"
-MIN_BATCH_SIZE="${MIN_BATCH_SIZE:-16}"
-OOM_RETRIES="${OOM_RETRIES:-4}"
-LR="${LR:-2e-5}"
-SIGMA_REG_WEIGHT="${SIGMA_REG_WEIGHT:-1e-3}"
-D_MODEL="${D_MODEL:-768}"
-NHEAD="${NHEAD:-16}"
-NUM_LAYERS="${NUM_LAYERS:-18}"
-DROPOUT="${DROPOUT:-0.1}"
-CONTEXT_WINDOW="${CONTEXT_WINDOW:-5}"   # -1 => full history, 5 => each step sees t-5..t
-LOG_SIGMA_MIN="${LOG_SIGMA_MIN:--6.0}"
-LOG_SIGMA_MAX="${LOG_SIGMA_MAX:-1.5}"
-SURPRISE_MODE="${SURPRISE_MODE:-rollout}" # rollout | teacher_forced
-AMP="${AMP:-1}"                          # 0 | 1
-MULTI_GPU="${MULTI_GPU:-1}"             # 0 | 1
+RUN_PROFILE="${RUN_PROFILE:-foundation}" # small | foundation
+if [ "$RUN_PROFILE" = "small" ]; then
+  : "${X:=10}"
+  : "${TRAIN_N:=5000}"
+  : "${VAL_N:=1000}"
+  : "${SEQ_LEN:=80}"
+  : "${DT:=0.05}"
+  : "${EPOCHS:=40}"
+  : "${BATCH_SIZE:=128}"
+  : "${MIN_BATCH_SIZE:=8}"
+  : "${OOM_RETRIES:=4}"
+  : "${LR:=1e-4}"
+  : "${SIGMA_REG_WEIGHT:=1e-3}"
+  : "${D_MODEL:=128}"
+  : "${NHEAD:=8}"
+  : "${NUM_LAYERS:=4}"
+  : "${DROPOUT:=0.1}"
+  : "${CONTEXT_WINDOW:=-1}"   # match old behavior: full history
+  : "${LOG_SIGMA_MIN:=-6.0}"
+  : "${LOG_SIGMA_MAX:=1.5}"
+  : "${SURPRISE_MODE:=rollout}"
+  : "${AMP:=1}"
+  : "${MULTI_GPU:=0}"
+elif [ "$RUN_PROFILE" = "foundation" ]; then
+  : "${X:=50}"
+  : "${TRAIN_N:=1500000}"
+  : "${VAL_N:=250000}"
+  : "${SEQ_LEN:=120}"
+  : "${DT:=0.04}"
+  : "${EPOCHS:=140}"
+  : "${BATCH_SIZE:=32}"
+  : "${MIN_BATCH_SIZE:=16}"
+  : "${OOM_RETRIES:=4}"
+  : "${LR:=2e-5}"
+  : "${SIGMA_REG_WEIGHT:=1e-3}"
+  : "${D_MODEL:=768}"
+  : "${NHEAD:=16}"
+  : "${NUM_LAYERS:=18}"
+  : "${DROPOUT:=0.1}"
+  : "${CONTEXT_WINDOW:=5}"    # local attention t-5..t
+  : "${LOG_SIGMA_MIN:=-6.0}"
+  : "${LOG_SIGMA_MAX:=1.5}"
+  : "${SURPRISE_MODE:=rollout}"
+  : "${AMP:=1}"
+  : "${MULTI_GPU:=1}"
+else
+  echo "[ERROR] Unknown RUN_PROFILE='$RUN_PROFILE'. Use RUN_PROFILE=small or RUN_PROFILE=foundation."
+  exit 2
+fi
+
 GPU_COUNT_RAW="${GPU_COUNT:-}"
 if [ -z "$GPU_COUNT_RAW" ] && [ -n "${SLURM_GPUS_ON_NODE:-}" ]; then
   GPU_COUNT_RAW="${SLURM_GPUS_ON_NODE}"
@@ -147,7 +176,7 @@ if [ "$SHELL_LOG_TO_OUTPUT_DIR" = "1" ]; then
 fi
 
 echo "[INFO] Launching free_fall_surprise_transformer.py with:"
-echo "  PROFILE=foundation_4gpu_longrun"
+echo "  RUN_PROFILE=$RUN_PROFILE"
 echo "  SCRIPT_DIR=$SCRIPT_DIR"
 echo "  OUTPUT_PARENT=$OUTPUT_PARENT"
 echo "  OUTPUT_DIR=$OUTPUT_DIR"
