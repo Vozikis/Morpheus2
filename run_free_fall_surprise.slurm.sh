@@ -11,7 +11,7 @@
 #SBATCH --error=/dev/null
 #SBATCH --account=ceesusers
 #SBATCH --partition=cees6000
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
