@@ -87,7 +87,7 @@ if [ "$RUN_PROFILE" = "small" ]; then
   : "${CONTEXT_WINDOW:=-1}"   # match old behavior: full history
   : "${LOG_SIGMA_MIN:=-6.0}"
   : "${LOG_SIGMA_MAX:=1.5}"
-  : "${SURPRISE_MODE:=rollout}"
+  : "${SURPRISE_MODE:=teacher_forced}"
   : "${AMP:=1}"
   : "${MULTI_GPU:=0}"
 elif [ "$RUN_PROFILE" = "foundation" ]; then
@@ -109,7 +109,7 @@ elif [ "$RUN_PROFILE" = "foundation" ]; then
   : "${CONTEXT_WINDOW:=5}"    # local attention t-5..t
   : "${LOG_SIGMA_MIN:=-6.0}"
   : "${LOG_SIGMA_MAX:=1.5}"
-  : "${SURPRISE_MODE:=rollout}"
+  : "${SURPRISE_MODE:=teacher_forced}"
   : "${AMP:=1}"
   : "${MULTI_GPU:=1}"
 else

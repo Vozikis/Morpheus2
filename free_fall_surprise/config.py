@@ -135,7 +135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--surprise_mode",
         type=str,
-        default="rollout",
+        default="teacher_forced",
         choices=["rollout", "teacher_forced"],
         help="How surprise is computed: open-loop rollout or teacher-forced one-step.",
     )
