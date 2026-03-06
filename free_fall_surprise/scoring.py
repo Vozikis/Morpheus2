@@ -13,6 +13,7 @@ from .runtime import log_progress
 
 
 TARGET_ABS_EPS = 1e-8
+EMPTY_TRAJECTORY_NLL_PENALTY = 1e6
 
 
 def valid_target_step_mask(targets: np.ndarray, eps: float = TARGET_ABS_EPS) -> np.ndarray:
@@ -56,11 +57,14 @@ def score_single_trajectory_teacher_forced(
     actual = trajectory[1:, :].astype(np.float64)[:effective_steps]
     time = np.arange(actual.shape[0], dtype=np.float64)
     step_mask = valid_target_step_mask(actual)
-    if not np.any(step_mask):
-        step_mask = np.ones(actual.shape[0], dtype=bool)
-    nll_eval = nll_steps[step_mask]
     err = pred - actual
-    err_eval = err[step_mask]
+    if np.any(step_mask):
+        nll_eval = nll_steps[step_mask]
+        err_eval = err[step_mask]
+    else:
+        # Empty/missing trajectories should not receive spuriously low surprise.
+        nll_eval = np.asarray([EMPTY_TRAJECTORY_NLL_PENALTY], dtype=np.float64)
+        err_eval = err
     rmse_pos = float(np.sqrt(np.mean(err_eval[:, 0] ** 2)))
     rmse_vel = float(np.sqrt(np.mean(err_eval[:, 1] ** 2)))
     mae_pos = float(np.mean(np.abs(err_eval[:, 0])))
@@ -130,11 +134,14 @@ def score_single_trajectory_rollout(
     actual = trajectory[1:, :].astype(np.float64)[:effective_steps]
     time = np.arange(actual.shape[0], dtype=np.float64)
     step_mask = valid_target_step_mask(actual)
-    if not np.any(step_mask):
-        step_mask = np.ones(actual.shape[0], dtype=bool)
-    nll_eval = nll_steps[step_mask]
     err = pred - actual
-    err_eval = err[step_mask]
+    if np.any(step_mask):
+        nll_eval = nll_steps[step_mask]
+        err_eval = err[step_mask]
+    else:
+        # Empty/missing trajectories should not receive spuriously low surprise.
+        nll_eval = np.asarray([EMPTY_TRAJECTORY_NLL_PENALTY], dtype=np.float64)
+        err_eval = err
     rmse_pos = float(np.sqrt(np.mean(err_eval[:, 0] ** 2)))
     rmse_vel = float(np.sqrt(np.mean(err_eval[:, 1] ** 2)))
     mae_pos = float(np.mean(np.abs(err_eval[:, 0])))

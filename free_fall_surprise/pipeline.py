@@ -402,6 +402,7 @@ def main() -> None:
                 "group": "in_distribution",
                 "surprise_mean_nll": score,
                 "surprise_std_nll": float(res["surprise_std_nll"]),
+                "scored_steps": int(len(res["nll_steps"])),
                 "rmse_pos": float(res["rmse_pos"]),
                 "rmse_vel": float(res["rmse_vel"]),
                 "mae_pos": float(res["mae_pos"]),
@@ -462,6 +463,7 @@ def main() -> None:
                 "group": "physical_ood",
                 "surprise_mean_nll": score,
                 "surprise_std_nll": float(res["surprise_std_nll"]),
+                "scored_steps": int(len(res["nll_steps"])),
                 "rmse_pos": float(res["rmse_pos"]),
                 "rmse_vel": float(res["rmse_vel"]),
                 "mae_pos": float(res["mae_pos"]),
@@ -477,7 +479,12 @@ def main() -> None:
     # Non-physical group
     for i in range(args.x):
         res = score_single_trajectory(
-            model_for_eval, nonphys_traj[i], stats, device, mode=args.surprise_mode
+            model_for_eval,
+            nonphys_traj[i],
+            stats,
+            device,
+            mode=args.surprise_mode,
+            valid_steps=args.seq_len - 1,
         )
         score = float(res["surprise_mean_nll"])
         nonphysical_scores.append(score)
@@ -521,6 +528,7 @@ def main() -> None:
                 "group": "non_physical",
                 "surprise_mean_nll": score,
                 "surprise_std_nll": float(res["surprise_std_nll"]),
+                "scored_steps": int(len(res["nll_steps"])),
                 "rmse_pos": float(res["rmse_pos"]),
                 "rmse_vel": float(res["rmse_vel"]),
                 "mae_pos": float(res["mae_pos"]),
