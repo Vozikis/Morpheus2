@@ -178,6 +178,12 @@ def parse_args() -> argparse.Namespace:
         choices=["rollout", "teacher_forced"],
         help="How surprise is computed: open-loop rollout or teacher-forced one-step.",
     )
+    parser.add_argument(
+        "--context_window",
+        type=int,
+        default=-1,
+        help="Max self-attention lookback (in steps). -1 uses full history; 5 means each step sees t-5..t only.",
+    )
     args = parser.parse_args()
     if args.x <= 0:
         raise ValueError("--x must be > 0")
@@ -205,6 +211,8 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--quality_eval_samples must be > 0")
     if args.max_visualizations_per_group < 0:
         raise ValueError("--max_visualizations_per_group must be >= 0")
+    if args.context_window < -1:
+        raise ValueError("--context_window must be >= -1")
     if args.save_gifs == 1 and imageio is None:
         raise RuntimeError("GIF saving requested but imageio is not installed.")
     return args
@@ -552,12 +560,14 @@ class CausalTrajectoryTransformer(nn.Module):
         num_layers: int,
         dropout: float,
         max_seq_len: int,
+        context_window: int = -1,
         log_sigma_min: float = -6.0,
         log_sigma_max: float = 1.5,
     ):
         super().__init__()
         self.input_proj = nn.Linear(2, d_model)
         self.pos_embed = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
+        self.context_window = int(context_window)
         self.log_sigma_min = float(log_sigma_min)
         self.log_sigma_max = float(log_sigma_max)
         layer = nn.TransformerEncoderLayer(
@@ -576,9 +586,15 @@ class CausalTrajectoryTransformer(nn.Module):
         # x: [B, T, 2]
         bsz, steps, _ = x.shape
         h = self.input_proj(x) + self.pos_embed[:, :steps, :]
-        causal_mask = torch.triu(
-            torch.ones(steps, steps, device=x.device, dtype=torch.bool), diagonal=1
-        )
+        idx = torch.arange(steps, device=x.device)
+        q_pos = idx.view(-1, 1)
+        k_pos = idx.view(1, -1)
+        future_mask = k_pos > q_pos
+        if self.context_window >= 0:
+            too_old_mask = k_pos < (q_pos - self.context_window)
+            causal_mask = future_mask | too_old_mask
+        else:
+            causal_mask = future_mask
         h = self.encoder(h, mask=causal_mask)
         out = self.head(h)
         mu = out[..., :2]
@@ -1098,7 +1114,7 @@ def main() -> None:
         print(f"[INFO] Device: {device}", flush=True)
         print(f"[INFO] Output directory: {output_dir}", flush=True)
         print(
-            "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} sigma_reg_weight={} d_model={} nhead={} num_layers={} log_sigma_min={} log_sigma_max={} surprise_mode={} amp={} multi_gpu={} world_size={} save_pngs={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
+            "[INFO] Config | x={} train_n={} val_n={} seq_len={} dt={} epochs={} batch_size={} lr={} sigma_reg_weight={} d_model={} nhead={} num_layers={} context_window={} log_sigma_min={} log_sigma_max={} surprise_mode={} amp={} multi_gpu={} world_size={} save_pngs={} save_gifs={} max_viz_per_group={} oom_retries={} min_batch_size={}".format(
                 args.x,
                 args.train_n,
                 args.val_n,
@@ -1111,6 +1127,7 @@ def main() -> None:
                 args.d_model,
                 args.nhead,
                 args.num_layers,
+                args.context_window,
                 args.log_sigma_min,
                 args.log_sigma_max,
                 args.surprise_mode,
@@ -1205,6 +1222,7 @@ def main() -> None:
             num_layers=args.num_layers,
             dropout=args.dropout,
             max_seq_len=args.seq_len - 1,
+            context_window=args.context_window,
             log_sigma_min=args.log_sigma_min,
             log_sigma_max=args.log_sigma_max,
         ).to(device)
