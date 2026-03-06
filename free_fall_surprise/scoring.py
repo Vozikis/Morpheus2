@@ -12,6 +12,15 @@ from .losses import LOG_2PI, gaussian_nll_per_timestep
 from .runtime import log_progress
 
 
+TARGET_ABS_EPS = 1e-8
+
+
+def valid_target_step_mask(targets: np.ndarray, eps: float = TARGET_ABS_EPS) -> np.ndarray:
+    finite_mask = np.isfinite(targets).all(axis=-1)
+    non_zero_mask = (np.abs(targets) > eps).all(axis=-1)
+    return np.logical_and(finite_mask, non_zero_mask)
+
+
 def score_single_trajectory_teacher_forced(
     model: nn.Module,
     trajectory: np.ndarray,
@@ -45,19 +54,24 @@ def score_single_trajectory_teacher_forced(
     pred = (pred_norm * stats.std + stats.mean)[:effective_steps]
     actual = trajectory[1:, :].astype(np.float64)[:effective_steps]
     time = np.arange(actual.shape[0], dtype=np.float64)
+    step_mask = valid_target_step_mask(actual)
+    if not np.any(step_mask):
+        step_mask = np.ones(actual.shape[0], dtype=bool)
+    nll_eval = nll_steps[step_mask]
     err = pred - actual
-    rmse_pos = float(np.sqrt(np.mean(err[:, 0] ** 2)))
-    rmse_vel = float(np.sqrt(np.mean(err[:, 1] ** 2)))
-    mae_pos = float(np.mean(np.abs(err[:, 0])))
-    mae_vel = float(np.mean(np.abs(err[:, 1])))
+    err_eval = err[step_mask]
+    rmse_pos = float(np.sqrt(np.mean(err_eval[:, 0] ** 2)))
+    rmse_vel = float(np.sqrt(np.mean(err_eval[:, 1] ** 2)))
+    mae_pos = float(np.mean(np.abs(err_eval[:, 0])))
+    mae_vel = float(np.mean(np.abs(err_eval[:, 1])))
     return {
-        "surprise_mean_nll": float(np.mean(nll_steps)),
-        "surprise_std_nll": float(np.std(nll_steps)),
+        "surprise_mean_nll": float(np.mean(nll_eval)),
+        "surprise_std_nll": float(np.std(nll_eval)),
         "rmse_pos": rmse_pos,
         "rmse_vel": rmse_vel,
         "mae_pos": mae_pos,
         "mae_vel": mae_vel,
-        "nll_steps": nll_steps,
+        "nll_steps": nll_eval,
         "pred": pred,
         "actual": actual,
         "time": time,
@@ -114,19 +128,24 @@ def score_single_trajectory_rollout(
     pred = pred_norm * stats.std + stats.mean
     actual = trajectory[1:, :].astype(np.float64)[:effective_steps]
     time = np.arange(actual.shape[0], dtype=np.float64)
+    step_mask = valid_target_step_mask(actual)
+    if not np.any(step_mask):
+        step_mask = np.ones(actual.shape[0], dtype=bool)
+    nll_eval = nll_steps[step_mask]
     err = pred - actual
-    rmse_pos = float(np.sqrt(np.mean(err[:, 0] ** 2)))
-    rmse_vel = float(np.sqrt(np.mean(err[:, 1] ** 2)))
-    mae_pos = float(np.mean(np.abs(err[:, 0])))
-    mae_vel = float(np.mean(np.abs(err[:, 1])))
+    err_eval = err[step_mask]
+    rmse_pos = float(np.sqrt(np.mean(err_eval[:, 0] ** 2)))
+    rmse_vel = float(np.sqrt(np.mean(err_eval[:, 1] ** 2)))
+    mae_pos = float(np.mean(np.abs(err_eval[:, 0])))
+    mae_vel = float(np.mean(np.abs(err_eval[:, 1])))
     return {
-        "surprise_mean_nll": float(np.mean(nll_steps)),
-        "surprise_std_nll": float(np.std(nll_steps)),
+        "surprise_mean_nll": float(np.mean(nll_eval)),
+        "surprise_std_nll": float(np.std(nll_eval)),
         "rmse_pos": rmse_pos,
         "rmse_vel": rmse_vel,
         "mae_pos": mae_pos,
         "mae_vel": mae_vel,
-        "nll_steps": nll_steps,
+        "nll_steps": nll_eval,
         "pred": pred,
         "actual": actual,
         "time": time,
