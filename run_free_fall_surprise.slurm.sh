@@ -15,8 +15,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=64G
-#SBATCH --time=3-00:00:00
+#SBATCH --mem=128G
+#SBATCH --time=4-00:00:00
 
 set -euo pipefail
 
@@ -68,19 +68,19 @@ ulimit -c 0
 # User-tunable defaults
 # -----------------------------
 X="${X:-50}"
-TRAIN_N="${TRAIN_N:-100000}"
-VAL_N="${VAL_N:-20000}"
-SEQ_LEN="${SEQ_LEN:-80}"
-DT="${DT:-0.05}"
-EPOCHS="${EPOCHS:-80}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
+TRAIN_N="${TRAIN_N:-1500000}"
+VAL_N="${VAL_N:-250000}"
+SEQ_LEN="${SEQ_LEN:-120}"
+DT="${DT:-0.04}"
+EPOCHS="${EPOCHS:-140}"
+BATCH_SIZE="${BATCH_SIZE:-32}"
 MIN_BATCH_SIZE="${MIN_BATCH_SIZE:-16}"
 OOM_RETRIES="${OOM_RETRIES:-4}"
-LR="${LR:-5e-5}"
+LR="${LR:-2e-5}"
 SIGMA_REG_WEIGHT="${SIGMA_REG_WEIGHT:-1e-3}"
-D_MODEL="${D_MODEL:-384}"
-NHEAD="${NHEAD:-12}"
-NUM_LAYERS="${NUM_LAYERS:-10}"
+D_MODEL="${D_MODEL:-768}"
+NHEAD="${NHEAD:-16}"
+NUM_LAYERS="${NUM_LAYERS:-18}"
 DROPOUT="${DROPOUT:-0.1}"
 LOG_SIGMA_MIN="${LOG_SIGMA_MIN:--6.0}"
 LOG_SIGMA_MAX="${LOG_SIGMA_MAX:-1.5}"
@@ -146,6 +146,7 @@ if [ "$SHELL_LOG_TO_OUTPUT_DIR" = "1" ]; then
 fi
 
 echo "[INFO] Launching free_fall_surprise_transformer.py with:"
+echo "  PROFILE=foundation_4gpu_longrun"
 echo "  SCRIPT_DIR=$SCRIPT_DIR"
 echo "  OUTPUT_PARENT=$OUTPUT_PARENT"
 echo "  OUTPUT_DIR=$OUTPUT_DIR"

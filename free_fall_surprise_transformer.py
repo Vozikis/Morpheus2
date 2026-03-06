@@ -315,29 +315,29 @@ def allreduce_sum(value: float, device: torch.device, enabled: bool) -> float:
 def sample_physical_params(rng: np.random.Generator, mode: str) -> Dict[str, float]:
     if mode == "train":
         params = {
-            # Real-world-ish Earth gravity and ball properties for drop experiments.
-            "g": float(rng.uniform(9.78, 9.83)),
-            "y0": float(rng.uniform(1.0, 25.0)),  # release height (m)
-            "v0": float(rng.uniform(0.0, 5.0)),  # initial speed (m/s)
-            "mass": float(rng.uniform(0.05, 0.8)),  # kg
-            "radius": float(rng.uniform(0.02, 0.11)),  # m
-            "drag_coefficient": float(rng.uniform(0.35, 0.55)),  # sphere-like Cd range
-            "air_density": float(rng.uniform(1.15, 1.30)),  # kg/m^3
-            "noise_std": float(rng.uniform(0.0, 0.003)),
+            # Broad physical "foundation" range for 1D ball drop on Earth-like conditions.
+            "g": float(rng.uniform(9.70, 9.90)),  # m/s^2
+            "y0": float(rng.uniform(2.0, 80.0)),  # release height (m)
+            "v0": float(rng.uniform(0.0, 15.0)),  # initial upward speed (m/s)
+            "mass": float(rng.uniform(0.01, 5.0)),  # kg
+            "radius": float(rng.uniform(0.005, 0.25)),  # m
+            "drag_coefficient": float(rng.uniform(0.15, 1.20)),  # broad sphere-like Cd range
+            "air_density": float(rng.uniform(0.90, 1.35)),  # kg/m^3 (altitude/weather variation)
+            "noise_std": float(rng.uniform(0.0, 0.01)),
             "floor": 0.0,
         }
     elif mode == "ood":
         params = {
-            # Out-of-distribution but still physically plausible ball-drop settings.
-            "g": float(rng.uniform(9.60, 10.00)),
-            "y0": float(rng.uniform(25.0, 45.0)),
-            "v0": float(rng.uniform(0.0, 1.5)),
-            "mass": float(rng.uniform(0.02, 1.2)),
-            "radius": float(rng.uniform(0.01, 0.15)),
-            # Keep these IID as requested.
-            "drag_coefficient": float(rng.uniform(0.35, 0.55)),
-            "air_density": float(rng.uniform(1.15, 1.30)),
-            "noise_std": float(rng.uniform(0.002, 0.01)),
+            # OOD physical tails: still lawful free-fall but shifted to harder extremes.
+            "g": float(rng.uniform(9.45, 10.20)),
+            "y0": float(rng.uniform(80.0, 180.0)),
+            "v0": float(rng.uniform(15.0, 35.0)),
+            "mass": float(rng.uniform(0.005, 8.0)),
+            "radius": float(rng.uniform(0.003, 0.35)),
+            # Keep these IID relative to training regime.
+            "drag_coefficient": float(rng.uniform(0.15, 1.20)),
+            "air_density": float(rng.uniform(0.90, 1.35)),
+            "noise_std": float(rng.uniform(0.008, 0.03)),
             "floor": 0.0,
         }
     else:
