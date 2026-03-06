@@ -598,6 +598,11 @@ def main() -> None:
     ftd_id_vs_physical = frechet_trajectory_distance(id_embeddings, physical_embeddings)
     ftd_id_vs_nonphysical = frechet_trajectory_distance(id_embeddings, nonphysical_embeddings)
 
+    with score_txt_path.open("a", encoding="utf-8") as f:
+        f.write("[FTD]\n")
+        f.write(f"id_vs_physical_ood={float(ftd_id_vs_physical):.10f}\n")
+        f.write(f"id_vs_non_physical={float(ftd_id_vs_nonphysical):.10f}\n")
+
     summary = {
         "config": vars(args),
         "device_used": str(device),
@@ -649,6 +654,7 @@ def main() -> None:
         "artifacts": {
             "per_trajectory_scores_csv": str(csv_path),
             "per_trajectory_scores_txt": str(score_txt_path),
+            "frechet_trajectory_distance_txt": str(paths["metrics"] / "frechet_trajectory_distance.txt"),
             "plots_dir": str(output_dir / "plots") if args.save_pngs == 1 else None,
             "gifs_dir": str(output_dir / "gifs") if args.save_gifs == 1 else None,
             "rendered_png_count_in_distribution": int(id_png_rendered),
@@ -661,6 +667,12 @@ def main() -> None:
         },
     }
 
+    ftd_txt_path = paths["metrics"] / "frechet_trajectory_distance.txt"
+    with ftd_txt_path.open("w", encoding="utf-8") as f:
+        f.write("Frechet Trajectory Distance\n")
+        f.write(f"id_vs_physical_ood={float(ftd_id_vs_physical):.10f}\n")
+        f.write(f"id_vs_non_physical={float(ftd_id_vs_nonphysical):.10f}\n")
+
     summary_path = paths["metrics"] / "summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
@@ -669,6 +681,7 @@ def main() -> None:
     print(f"[INFO] Saved metrics: {summary_path}", flush=True)
     print(f"[INFO] Saved per-trajectory CSV: {csv_path}", flush=True)
     print(f"[INFO] Saved per-trajectory score text: {score_txt_path}", flush=True)
+    print(f"[INFO] Saved Frechet Trajectory Distance text: {ftd_txt_path}", flush=True)
     print(
         "[INFO] Surprise means | in_distribution={:.5f} | physical_ood={:.5f} | non_physical={:.5f} | delta(non_physical-physical_ood)={:.5f}".format(
             float(np.mean(id_scores_np)),
@@ -679,7 +692,14 @@ def main() -> None:
         flush=True,
     )
     print(
-        "[INFO] FTD | id_vs_physical_ood={:.5f} | id_vs_non_physical={:.5f}".format(
+        "[INFO] Frechet Trajectory Distance | id_vs_physical_ood={:.5f} | id_vs_non_physical={:.5f}".format(
+            float(ftd_id_vs_physical),
+            float(ftd_id_vs_nonphysical),
+        ),
+        flush=True,
+    )
+    print(
+        "[FTD] id_vs_physical_ood={:.10f} id_vs_non_physical={:.10f}".format(
             float(ftd_id_vs_physical),
             float(ftd_id_vs_nonphysical),
         ),
